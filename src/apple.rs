@@ -18,18 +18,12 @@ mod source {
     use crate::gpu::{Gpu, GpuUse};
     use std::collections::HashMap;
     use std::process::Command;
-    use std::sync::mpsc::{Receiver, channel};
     use std::time::Duration;
 
-    /// How often `ioreg` is run.
-    const EVERY: Duration = Duration::from_millis(500);
     /// How long to wait before reading again a reading that collided.
     const AGAIN: Duration = Duration::from_millis(50);
 
-    /// The GPUs' readings, from `ioreg` run on a thread of its own, since
-    /// running it takes tens of milliseconds.
     pub struct Source {
-        rx: Receiver<Vec<Reading>>,
         last: Vec<Reading>,
     }
 
@@ -72,25 +66,11 @@ mod source {
                     ..Default::default()
                 })
                 .collect();
-            let (tx, rx) = channel();
-            let mut prev = last.clone();
-            std::thread::spawn(move || {
-                loop {
-                    let r = read_settled(&prev);
-                    if tx.send(r.clone()).is_err() {
-                        break;
-                    }
-                    prev = r;
-                    std::thread::sleep(EVERY);
-                }
-            });
-            Ok((Source { rx, last }, "Apple GPU".into(), gpus))
+            Ok((Source { last }, "Apple GPU".into(), gpus))
         }
 
         pub fn sample(&mut self, gpus: &mut [Gpu], _: &mut HashMap<u32, GpuUse>) {
-            if let Some(r) = self.rx.try_iter().last() {
-                self.last = r;
-            }
+            self.last = read_settled(&self.last);
             for (g, r) in gpus.iter_mut().zip(&self.last) {
                 g.util = r.util;
                 g.mem_used = r.mem_used.unwrap_or(0);
@@ -100,7 +80,7 @@ mod source {
 }
 
 /// One GPU's entry in `ioreg`.
-#[derive(Debug, PartialEq, Default, Clone)]
+#[derive(Debug, PartialEq, Default)]
 pub struct Reading {
     pub name: String,
     pub util: Option<u32>,

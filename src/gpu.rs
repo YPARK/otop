@@ -10,6 +10,7 @@
 
 use crate::hist::History;
 use std::collections::HashMap;
+use std::sync::mpsc::{Receiver, SyncSender, channel, sync_channel};
 
 #[cfg(target_os = "macos")]
 use crate::apple as source;
@@ -56,19 +57,25 @@ impl Gpu {
         crate::sys::frac(self.mem_used, self.mem_total)
     }
 
-    /// Forgets the last sample's readings, keeping what does not change.
-    fn clear(&mut self) {
-        *self = Gpu {
+    /// What does not change, to read a sample into: what a read fails to
+    /// give is then unknown, not what it was last time.
+    fn fresh(&self) -> Gpu {
+        Gpu {
             index: self.index,
-            name: std::mem::take(&mut self.name),
+            name: self.name.clone(),
             mem_total: self.mem_total,
             power_limit: self.power_limit,
             clock_gr_max: self.clock_gr_max,
             cores: self.cores,
-            hist_util: std::mem::take(&mut self.hist_util),
-            hist_mem: std::mem::take(&mut self.hist_mem),
             ..Default::default()
-        };
+        }
+    }
+
+    /// Takes a sample's readings, keeping this GPU's history.
+    fn take(&mut self, mut reading: Gpu) {
+        reading.hist_util = std::mem::take(&mut self.hist_util);
+        reading.hist_mem = std::mem::take(&mut self.hist_mem);
+        *self = reading;
     }
 
     /// Records this sample in the history.
@@ -89,8 +96,41 @@ pub struct GpuUse {
     pub sm: Option<u32>,
 }
 
+/// One sample of the GPUs, and of the processes on them.
+type Sample = (Vec<Gpu>, HashMap<u32, GpuUse>);
+
+fn read(source: &mut source::Source, gpus: &[Gpu]) -> Sample {
+    let mut sample: Sample = (gpus.iter().map(Gpu::fresh).collect(), HashMap::new());
+    source.sample(&mut sample.0, &mut sample.1);
+    sample
+}
+
+/// The GPUs' source, read on a thread of its own: some reads take tens of
+/// milliseconds (NVML's PCIe throughput, `ioreg`), and the screen should
+/// not wait for them.
+struct Reader {
+    /// Asks for a sample; at most one is asked for at a time.
+    ask: SyncSender<()>,
+    samples: Receiver<Sample>,
+}
+
+impl Reader {
+    fn spawn(mut source: source::Source, gpus: Vec<Gpu>) -> Self {
+        let (ask, asked) = sync_channel(1);
+        let (tx, samples) = channel();
+        std::thread::spawn(move || {
+            while asked.recv().is_ok() {
+                if tx.send(read(&mut source, &gpus)).is_err() {
+                    break;
+                }
+            }
+        });
+        Reader { ask, samples }
+    }
+}
+
 pub struct Gpus {
-    source: Option<source::Source>,
+    reader: Option<Reader>,
     /// The driver, or why there are no GPUs, for the header.
     pub info: String,
     pub gpus: Vec<Gpu>,
@@ -99,17 +139,23 @@ pub struct Gpus {
 
 impl Gpus {
     pub fn new() -> Self {
-        let (source, info, gpus) = match source::Source::open() {
-            Ok((s, info, gpus)) => (Some(s), info, gpus),
-            Err(why) => (None, why, Vec::new()),
-        };
         let mut g = Gpus {
-            source,
-            info,
-            gpus,
+            reader: None,
+            info: String::new(),
+            gpus: Vec::new(),
             procs: HashMap::new(),
         };
-        g.sample();
+        match source::Source::open() {
+            Ok((mut source, info, gpus)) => {
+                // The first sample at once, so there is one to show.
+                let first = read(&mut source, &gpus);
+                g.reader = Some(Reader::spawn(source, gpus.clone()));
+                g.info = info;
+                g.gpus = gpus;
+                g.take(first);
+            }
+            Err(why) => g.info = why,
+        }
         g
     }
 
@@ -119,18 +165,24 @@ impl Gpus {
         source::PER_PROCESS && !self.gpus.is_empty()
     }
 
+    fn take(&mut self, (gpus, procs): Sample) {
+        for (g, r) in self.gpus.iter_mut().zip(gpus) {
+            g.take(r);
+            g.record();
+        }
+        self.procs = procs;
+    }
+
+    /// Takes the newest sample the reader has, if any, and asks for the
+    /// next.
     pub fn sample(&mut self) {
-        if let Some(s) = &mut self.source {
-            self.procs.clear();
-            // What a GPU's read fails to give is shown as unknown, not as
-            // what it was last time.
-            for g in &mut self.gpus {
-                g.clear();
-            }
-            s.sample(&mut self.gpus, &mut self.procs);
-            for g in &mut self.gpus {
-                g.record();
-            }
+        let Some(r) = &self.reader else { return };
+        let newest = r.samples.try_iter().last();
+        let _ = r.ask.try_send(());
+        match newest {
+            Some(s) => self.take(s),
+            // None yet: the last readings again, so the charts keep time.
+            None => self.gpus.iter_mut().for_each(Gpu::record),
         }
     }
 }

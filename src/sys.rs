@@ -4,6 +4,7 @@ use crate::hist::History;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::time::{Duration, Instant};
 use sysinfo::{
     CpuRefreshKind, MemoryRefreshKind, Pid, ProcessRefreshKind, ProcessesToUpdate, Signal, System,
     Uid, UpdateKind,
@@ -81,6 +82,8 @@ impl Users {
 pub struct Sys {
     sys: System,
     users: Users,
+    /// When every process's command and user were last read.
+    reread: Instant,
     pub host: String,
     pub cpu_brand: String,
     /// Each CPU's use, in percent.
@@ -95,13 +98,17 @@ pub struct Sys {
     pub procs: Vec<Proc>,
 }
 
-fn proc_refresh() -> ProcessRefreshKind {
+/// How often every process's command and user are read again, as exec,
+/// setuid and setproctitle change them; between, they are read for new
+/// processes alone, which costs a third as much.
+const REREAD: Duration = Duration::from_secs(5);
+
+fn proc_refresh(names: UpdateKind) -> ProcessRefreshKind {
     ProcessRefreshKind::nothing()
         .with_cpu()
         .with_memory()
-        // Read every time: exec, setuid and setproctitle change them.
-        .with_cmd(UpdateKind::Always)
-        .with_user(UpdateKind::Always)
+        .with_cmd(names)
+        .with_user(names)
         // Processes alone: on Linux each thread would be read too.
         .without_tasks()
 }
@@ -110,7 +117,11 @@ impl Sys {
     pub fn new() -> Self {
         let mut sys = System::new();
         sys.refresh_cpu_specifics(CpuRefreshKind::nothing().with_cpu_usage());
-        sys.refresh_processes_specifics(ProcessesToUpdate::All, true, proc_refresh());
+        sys.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            proc_refresh(UpdateKind::OnlyIfNotSet),
+        );
         let cpu_brand = sys
             .cpus()
             .first()
@@ -119,6 +130,7 @@ impl Sys {
         let mut s = Sys {
             sys,
             users: Users::new(),
+            reread: Instant::now(),
             host: System::host_name().unwrap_or_default(),
             cpu_brand,
             cores: Vec::new(),
@@ -142,7 +154,13 @@ impl Sys {
         let sys = &mut self.sys;
         sys.refresh_cpu_specifics(CpuRefreshKind::nothing().with_cpu_usage());
         sys.refresh_memory_specifics(MemoryRefreshKind::everything());
-        sys.refresh_processes_specifics(ProcessesToUpdate::All, true, proc_refresh());
+        let names = if self.reread.elapsed() >= REREAD {
+            self.reread = Instant::now();
+            UpdateKind::Always
+        } else {
+            UpdateKind::OnlyIfNotSet
+        };
+        sys.refresh_processes_specifics(ProcessesToUpdate::All, true, proc_refresh(names));
 
         self.cores = sys.cpus().iter().map(|c| c.cpu_usage()).collect();
         self.cpu = sys.global_cpu_usage();
