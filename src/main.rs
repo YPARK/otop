@@ -11,6 +11,7 @@ mod gpu;
 mod hist;
 #[cfg(not(target_os = "macos"))]
 mod nvidia;
+mod ps;
 mod sys;
 mod ui;
 

@@ -14,6 +14,7 @@ use ratatui::widgets::{
     Axis, Bar, BarChart, BarGroup, Block, Borders, Cell, Chart, Clear, Dataset, GraphType,
     LegendPosition, LineGauge, Paragraph, Row, Table, TableState,
 };
+use std::fmt::Write as _;
 use std::io::{self, Write};
 use std::time::Duration;
 
@@ -48,15 +49,16 @@ pub fn opt(v: Option<u32>) -> String {
 }
 
 pub fn bytes(b: u64) -> String {
-    const GIB: f64 = (1u64 << 30) as f64;
-    const MIB: f64 = (1u64 << 20) as f64;
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * KIB;
+    const GIB: f64 = MIB * KIB;
     let b = b as f64;
     if b >= GIB {
         format!("{:.1}G", b / GIB)
     } else if b >= MIB {
         format!("{:.0}M", b / MIB)
     } else {
-        format!("{:.0}K", b / 1024.0)
+        format!("{:.0}K", b / KIB)
     }
 }
 
@@ -803,10 +805,10 @@ pub fn print_once(app: &App, out: &mut impl Write) -> io::Result<()> {
         );
         // What the GPU's source gives, alone.
         if let Some(t) = g.temp {
-            line += &format!("  {t}°C");
+            let _ = write!(line, "  {t}°C");
         }
         if let Some(p) = g.power {
-            line += &format!("  {p}W");
+            let _ = write!(line, "  {p}W");
         }
         writeln!(out, "{line}")?;
     }

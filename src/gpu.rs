@@ -10,9 +10,7 @@
 
 use crate::hist::History;
 use std::collections::HashMap;
-use std::sync::mpsc::{
-    Receiver, RecvTimeoutError, SyncSender, TryRecvError, channel, sync_channel,
-};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, channel, sync_channel};
 use std::time::Duration;
 
 #[cfg(target_os = "macos")]
@@ -145,24 +143,26 @@ pub struct Gpus {
 
 impl Gpus {
     pub fn new() -> Self {
-        let mut g = Gpus {
-            reader: None,
-            info: String::new(),
-            gpus: Vec::new(),
-            procs: HashMap::new(),
-        };
         match source::Source::open() {
             Ok((mut source, info, gpus)) => {
                 // The first sample at once, so there is one to show.
                 let first = read(&mut source, &gpus);
-                g.reader = Some(Reader::spawn(source, gpus.clone()));
-                g.info = info;
-                g.gpus = gpus;
+                let mut g = Gpus {
+                    reader: Some(Reader::spawn(source, gpus.clone())),
+                    info,
+                    gpus,
+                    procs: HashMap::new(),
+                };
                 g.take(first);
+                g
             }
-            Err(why) => g.info = why,
+            Err(info) => Gpus {
+                reader: None,
+                info,
+                gpus: Vec::new(),
+                procs: HashMap::new(),
+            },
         }
-        g
     }
 
     /// Whether there are GPUs, and their source says which processes use
@@ -184,31 +184,31 @@ impl Gpus {
     /// charts keep time.
     pub fn sample(&mut self) {
         let Some(r) = &self.reader else { return };
-        let mut newest = Err(TryRecvError::Empty);
-        for s in r.samples.try_iter() {
-            newest = Ok(s);
-        }
+        let mut newest = r.samples.try_iter().last();
+        let mut stopped = false;
         // Asked and answered in time, the sample is in step with the screen.
         if r.ask.try_send(()).is_ok() {
-            newest = match r.samples.recv_timeout(WAIT) {
-                Ok(s) => Ok(s),
-                Err(RecvTimeoutError::Timeout) => newest,
-                Err(RecvTimeoutError::Disconnected) => Err(TryRecvError::Disconnected),
-            };
-        }
-        match newest {
-            Ok(s) => self.take(s),
-            Err(TryRecvError::Empty) => self.gpus.iter_mut().for_each(Gpu::record),
-            // The reader has stopped: its last readings are no longer true.
-            Err(TryRecvError::Disconnected) => {
-                self.reader = None;
-                self.info = format!("{}  (GPUs no longer read)", self.info);
-                for g in &mut self.gpus {
-                    g.take(g.fresh());
-                    g.record();
-                }
-                self.procs.clear();
+            match r.samples.recv_timeout(WAIT) {
+                Ok(s) => newest = Some(s),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => stopped = true,
             }
         }
+        if stopped {
+            self.stop();
+        } else if let Some(s) = newest {
+            self.take(s);
+        } else {
+            self.gpus.iter_mut().for_each(Gpu::record);
+        }
+    }
+
+    /// The reader has stopped: its last readings are no longer true, so
+    /// the GPUs are shown as unknown.
+    fn stop(&mut self) {
+        self.reader = None;
+        self.info += "  (GPUs no longer read)";
+        let unknown = self.gpus.iter().map(Gpu::fresh).collect();
+        self.take((unknown, HashMap::new()));
     }
 }
