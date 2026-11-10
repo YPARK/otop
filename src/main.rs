@@ -1,4 +1,4 @@
-//! gputop: monitor NVIDIA GPUs, and the processes on them, in the terminal.
+//! otop: monitor NVIDIA GPUs, and the processes on them, in the terminal.
 //!
 //! GPUs are read through NVML, which is loaded at run time from NVIDIA's
 //! driver, and drawn with ratatui.
