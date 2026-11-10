@@ -12,11 +12,6 @@ pub use source::Source;
 #[cfg(target_os = "macos")]
 pub const PER_PROCESS: bool = false;
 
-/// The IORegistry is read every 250 ms at least, so a change in use shows
-/// in a quarter of a second, and a collided reading is soon replaced.
-#[cfg(target_os = "macos")]
-pub const MOST_MS: Option<u64> = Some(250);
-
 #[cfg(target_os = "macos")]
 mod source {
     use super::{Reading, collided, parse};
@@ -204,9 +199,19 @@ mod tests {
     }
 
     #[test]
-    fn a_gpu_that_never_gives_scene_bytes_is_not_read_again() {
+    fn a_gpu_whose_scene_bytes_stay_0_is_not_read_again() {
         let mut r = reading(0);
         r.scene = Some(0);
+        assert!(!collided(
+            std::slice::from_ref(&r),
+            std::slice::from_ref(&r)
+        ));
+    }
+
+    #[test]
+    fn a_gpu_that_never_gives_scene_bytes_is_not_read_again() {
+        let mut r = reading(0);
+        r.scene = None;
         assert!(!collided(
             std::slice::from_ref(&r),
             std::slice::from_ref(&r)

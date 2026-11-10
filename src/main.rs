@@ -53,7 +53,7 @@ struct Args {
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let every = Duration::from_millis(args.interval);
-    let app = app::App::new(sys::Sys::new(), gpu::Gpus::new(every), every);
+    let app = app::App::new(sys::Sys::new(), gpu::Gpus::new(), every);
     if args.once {
         // Piped into `head`, say, stdout may close early; that is not an error.
         return match ui::print_once(&app, &mut std::io::stdout().lock()) {

@@ -266,15 +266,10 @@ impl App {
                     _ => Only::All,
                 };
             }
-            KeyCode::Char('+') | KeyCode::Char('=') => self.set_interval(faster(self.interval)),
-            KeyCode::Char('-') => self.set_interval(slower(self.interval)),
+            KeyCode::Char('+') | KeyCode::Char('=') => self.interval = faster(self.interval),
+            KeyCode::Char('-') => self.interval = slower(self.interval),
             _ => {}
         }
-    }
-
-    fn set_interval(&mut self, every: Duration) {
-        self.interval = every;
-        self.gpus.set_interval(every);
     }
 
     /// Picks the row `i`, or none where there are no rows.
@@ -337,21 +332,18 @@ impl App {
 /// The refresh intervals `+` and `-` step through, in milliseconds.
 const STEPS: [u64; 9] = [100, 250, 500, 1000, 2000, 5000, 10000, 30000, 60000];
 
-/// The next step faster than `d`, or the fastest.
+/// The next step faster than `d`, or `d` where there is none.
 fn faster(d: Duration) -> Duration {
     let ms = d.as_millis() as u64;
-    let step = STEPS.iter().rev().find(|&&s| s < ms).unwrap_or(&STEPS[0]);
-    Duration::from_millis(*step)
+    let step = STEPS.iter().rev().find(|&&s| s < ms);
+    step.map_or(d, |&s| Duration::from_millis(s))
 }
 
-/// The next step slower than `d`, or the slowest.
+/// The next step slower than `d`, or `d` where there is none.
 fn slower(d: Duration) -> Duration {
     let ms = d.as_millis() as u64;
-    let step = STEPS
-        .iter()
-        .find(|&&s| s > ms)
-        .unwrap_or(&STEPS[STEPS.len() - 1]);
-    Duration::from_millis(*step)
+    let step = STEPS.iter().find(|&&s| s > ms);
+    step.map_or(d, |&s| Duration::from_millis(s))
 }
 
 #[cfg(test)]
@@ -374,6 +366,12 @@ mod tests {
     fn steps_stop_at_the_ends() {
         assert_eq!(faster(ms(100)), ms(100));
         assert_eq!(slower(ms(60000)), ms(60000));
+    }
+
+    #[test]
+    fn steps_never_go_the_wrong_way() {
+        assert_eq!(slower(ms(120000)), ms(120000));
+        assert_eq!(faster(ms(50)), ms(50));
     }
 
     #[test]

@@ -88,9 +88,11 @@ pub struct Sys {
     /// When every process's command and user were last read.
     reread: Instant,
     /// On macOS, what ps says of processes sysinfo cannot read, those of
-    /// other users: by PID, their user, resident memory and command.
+    /// other users, read every `REREAD` on a thread of its own.
     #[cfg(target_os = "macos")]
-    ps: HashMap<u32, (Arc<str>, u64, String)>,
+    ps: Ps,
+    #[cfg(target_os = "macos")]
+    ps_rx: Receiver<Ps>,
     pub host: String,
     pub cpu_brand: String,
     /// Each CPU's use, in percent.
@@ -140,6 +142,8 @@ impl Sys {
             reread: Instant::now(),
             #[cfg(target_os = "macos")]
             ps: ps(),
+            #[cfg(target_os = "macos")]
+            ps_rx: ps_thread(),
             host: System::host_name().unwrap_or_default(),
             cpu_brand,
             cores: Vec::new(),
@@ -165,10 +169,6 @@ impl Sys {
         sys.refresh_memory_specifics(MemoryRefreshKind::everything());
         let names = if self.reread.elapsed() >= REREAD {
             self.reread = Instant::now();
-            #[cfg(target_os = "macos")]
-            {
-                self.ps = ps();
-            }
             UpdateKind::Always
         } else {
             UpdateKind::OnlyIfNotSet
@@ -188,7 +188,12 @@ impl Sys {
         let users = &mut self.users;
         users.receive();
         #[cfg(target_os = "macos")]
-        let ps = &self.ps;
+        let ps = {
+            if let Some(ps) = self.ps_rx.try_iter().last() {
+                self.ps = ps;
+            }
+            &self.ps
+        };
         self.procs = sys
             .processes()
             .values()
@@ -207,7 +212,12 @@ impl Sys {
                 // Another user's process, which sysinfo cannot read on
                 // macOS: what ps said of it.
                 #[cfg(target_os = "macos")]
-                let (user, mem, command) = fill(ps.get(&pid), user, p.memory(), command);
+                let (user, mem, command) = {
+                    let e = ps
+                        .get(&pid)
+                        .filter(|e| e.start.abs_diff(p.start_time()) <= 2);
+                    fill(e, user, p.memory(), command)
+                };
                 #[cfg(not(target_os = "macos"))]
                 let mem = p.memory();
                 let command = if command.is_empty() {
@@ -271,39 +281,78 @@ fn user_name(uid: &Uid) -> Arc<str> {
         .into()
 }
 
-/// Every process's user, resident memory and command, as `ps` gives them,
-/// by PID: on macOS ps can read other users' processes, which sysinfo
-/// cannot without root.
+/// What `ps` says of a process.
 #[cfg(any(target_os = "macos", test))]
-fn parse_ps(out: &str) -> HashMap<u32, (Arc<str>, u64, String)> {
+#[derive(Debug, PartialEq)]
+struct PsEntry {
+    user: Arc<str>,
+    /// Resident memory, in bytes.
+    rss: u64,
+    command: String,
+    /// When it started, in seconds since the epoch, to within a second: so
+    /// an entry is not taken for a later process given the same PID.
+    start: u64,
+}
+
+#[cfg(any(target_os = "macos", test))]
+type Ps = HashMap<u32, PsEntry>;
+
+/// Every process, as `ps -axo pid=,etime=,rss=,user=,args=` gives them, by
+/// PID, at `now` seconds since the epoch: on macOS ps can read other users'
+/// processes, which sysinfo cannot without root.
+#[cfg(any(target_os = "macos", test))]
+fn parse_ps(out: &str, now: u64) -> Ps {
     out.lines()
         .filter_map(|l| {
             let mut f = l.split_whitespace();
             let pid = f.next()?.parse().ok()?;
+            let start = now.checked_sub(elapsed(f.next()?)?)?;
             let rss: u64 = f.next()?.parse().ok()?;
             let user = f.next()?.into();
-            let args = f.collect::<Vec<_>>().join(" ");
-            Some((pid, (user, rss * 1024, args)))
+            let command = f.collect::<Vec<_>>().join(" ");
+            Some((
+                pid,
+                PsEntry {
+                    user,
+                    rss: rss * 1024,
+                    command,
+                    start,
+                },
+            ))
         })
         .collect()
+}
+
+/// Seconds in ps's `[[dd-]hh:]mm:ss`.
+#[cfg(any(target_os = "macos", test))]
+fn elapsed(etime: &str) -> Option<u64> {
+    let (days, rest) = match etime.split_once('-') {
+        Some((d, r)) => (d.parse::<u64>().ok()?, r),
+        None => (0, etime),
+    };
+    let mut secs = 0;
+    for part in rest.split(':') {
+        secs = secs * 60 + part.parse::<u64>().ok()?;
+    }
+    Some(days * 86400 + secs)
 }
 
 /// What sysinfo could not read of a process, from what ps said of it.
 #[cfg(target_os = "macos")]
 fn fill(
-    ps: Option<&(Arc<str>, u64, String)>,
+    ps: Option<&PsEntry>,
     user: Option<Arc<str>>,
     mem: u64,
     command: String,
 ) -> (Option<Arc<str>>, u64, String) {
-    let Some((u, rss, args)) = ps else {
+    let Some(e) = ps else {
         return (user, mem, command);
     };
     (
-        user.or_else(|| Some(u.clone())),
-        if mem == 0 { *rss } else { mem },
+        user.or_else(|| Some(e.user.clone())),
+        if mem == 0 { e.rss } else { mem },
         if command.is_empty() {
-            args.clone()
+            e.command.clone()
         } else {
             command
         },
@@ -311,12 +360,31 @@ fn fill(
 }
 
 #[cfg(target_os = "macos")]
-fn ps() -> HashMap<u32, (Arc<str>, u64, String)> {
+fn ps() -> Ps {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
     std::process::Command::new("ps")
-        .args(["-axo", "pid=,rss=,user=,args="])
+        .args(["-axo", "pid=,etime=,rss=,user=,args="])
         .output()
-        .map(|o| parse_ps(&String::from_utf8_lossy(&o.stdout)))
+        .map(|o| parse_ps(&String::from_utf8_lossy(&o.stdout), now))
         .unwrap_or_default()
+}
+
+/// Runs ps every `REREAD` on a thread of its own: it takes tens of
+/// milliseconds, which the screen should not wait for.
+#[cfg(target_os = "macos")]
+fn ps_thread() -> Receiver<Ps> {
+    let (tx, rx) = channel();
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(REREAD);
+            if tx.send(ps()).is_err() {
+                break;
+            }
+        }
+    });
+    rx
 }
 
 pub fn frac(used: u64, total: u64) -> f64 {
@@ -329,19 +397,30 @@ pub fn frac(used: u64, total: u64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_ps;
+    use super::{elapsed, parse_ps};
 
     #[test]
     fn reads_ps() {
         let ps = parse_ps(
-            "  488   1696 root     /usr/sbin/distnoted agent\n 1164   1584 _rmd     /usr/libexec/rmd\nbad line\n",
+            "  488 2-03:04:05   1696 root     /usr/sbin/distnoted agent\n 1164       00:07   1584 _rmd     /usr/libexec/rmd\nbad line\n",
+            1_000_000,
         );
-        let (user, rss, args) = &ps[&488];
+        let e = &ps[&488];
         assert_eq!(
-            (&**user, *rss, args.as_str()),
+            (&*e.user, e.rss, e.command.as_str()),
             ("root", 1696 * 1024, "/usr/sbin/distnoted agent")
         );
-        assert_eq!(&*ps[&1164].0, "_rmd");
+        assert_eq!(e.start, 1_000_000 - (2 * 86400 + 3 * 3600 + 4 * 60 + 5));
+        assert_eq!(&*ps[&1164].user, "_rmd");
+        assert_eq!(ps[&1164].start, 1_000_000 - 7);
         assert_eq!(ps.len(), 2);
+    }
+
+    #[test]
+    fn reads_elapsed_times() {
+        assert_eq!(elapsed("00:07"), Some(7));
+        assert_eq!(elapsed("01:02:03"), Some(3723));
+        assert_eq!(elapsed("3-00:00:01"), Some(3 * 86400 + 1));
+        assert_eq!(elapsed("x"), None);
     }
 }

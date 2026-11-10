@@ -12,9 +12,6 @@ use std::time::{Duration, Instant};
 /// NVML says which processes use each GPU, and how much.
 pub const PER_PROCESS: bool = true;
 
-/// NVML is read as often as the screen is refreshed.
-pub const MOST_MS: Option<u64> = None;
-
 pub struct Source {
     nvml: Nvml,
     /// Per GPU, the time of the last process sample read, so each read

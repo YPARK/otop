@@ -840,7 +840,7 @@ pub fn print_once(app: &App, out: &mut impl Write) -> io::Result<()> {
                 opt(g.and_then(|g| g.sm)),
             )?;
         }
-        writeln!(out, "  {:<16} {}", p.name, p.command)?;
+        writeln!(out, "  {:<16.16} {}", p.name, p.command)?;
     }
     Ok(())
 }
