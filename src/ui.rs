@@ -157,8 +157,13 @@ fn draw_cpu(f: &mut Frame, app: &App, area: Rect, tall: bool) {
     let inner = block.inner(area);
     f.render_widget(block, area);
     let cores = if tall {
-        let (chart, cores) = cpu_layout(s.cores.len() as u16, inner);
+        let (chart, divider, cores) = cpu_layout(s.cores.len() as u16, inner);
         draw_history(f, chart, &s.hist_cpu, Color::Cyan);
+        // So the chart's line does not run into the CPUs' bars.
+        if let Some(d) = divider {
+            let lines = vec![Line::from("│"); d.height as usize];
+            f.render_widget(Paragraph::new(lines).dark_gray(), d);
+        }
         cores
     } else {
         // No chart: the total as a gauge, over the CPUs.
@@ -173,14 +178,16 @@ fn draw_cpu(f: &mut Frame, app: &App, area: Rect, tall: bool) {
     draw_cores(f, &s.cores, cores);
 }
 
-/// The CPU chart's area and the CPUs' own, inside the CPU panel: side by
-/// side, a column apart, where the chart keeps 20 columns, or else the
-/// chart over a few rows of a bar per CPU.
-fn cpu_layout(n: u16, inner: Rect) -> (Rect, Rect) {
+/// The CPU chart's area, the divider's beside it if any, and the CPUs'
+/// own, inside the CPU panel: side by side, a divider apart, where the
+/// chart keeps 20 columns, or else the chart over a few rows of a bar per
+/// CPU.
+fn cpu_layout(n: u16, inner: Rect) -> (Rect, Option<Rect>, Rect) {
     const CHART: u16 = 20;
     let grid = n.div_ceil(inner.height.max(1)) * CELL;
-    let bars = if n * 2 - 1 + CHART < inner.width {
-        n * 2 - 1
+    let spaced = (n * 2).saturating_sub(1);
+    let bars = if spaced + CHART < inner.width {
+        spaced
     } else {
         n
     };
@@ -190,17 +197,17 @@ fn cpu_layout(n: u16, inner: Rect) -> (Rect, Rect) {
         bars
     };
     if side + 1 + CHART <= inner.width {
-        let [chart, _, cores] = Layout::horizontal([
+        let [chart, divider, cores] = Layout::horizontal([
             Constraint::Min(CHART),
             Constraint::Length(1),
             Constraint::Length(side),
         ])
         .areas(inner);
-        (chart, cores)
+        (chart, Some(divider), cores)
     } else {
         let [chart, cores] =
             Layout::vertical([Constraint::Min(0), Constraint::Length(3)]).areas(inner);
-        (chart, cores)
+        (chart, None, cores)
     }
 }
 

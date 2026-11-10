@@ -14,7 +14,7 @@ pub const PER_PROCESS: bool = false;
 
 #[cfg(target_os = "macos")]
 mod source {
-    use super::{Reading, parse};
+    use super::{Reading, parse, steady};
     use crate::gpu::{Gpu, GpuUse};
     use std::collections::HashMap;
     use std::process::Command;
@@ -28,7 +28,8 @@ mod source {
     /// running it takes tens of milliseconds.
     pub struct Source {
         rx: Receiver<Vec<Reading>>,
-        last: Vec<Reading>,
+        /// The last two readings, older first.
+        last: [Vec<Reading>; 2],
     }
 
     fn ioreg() -> Vec<Reading> {
@@ -65,14 +66,16 @@ mod source {
                     std::thread::sleep(EVERY);
                 }
             });
+            let last = [Vec::new(), last];
             Ok((Source { rx, last }, "Apple GPU".into(), gpus))
         }
 
         pub fn sample(&mut self, gpus: &mut [Gpu], _: &mut HashMap<u32, GpuUse>) {
-            if let Some(r) = self.rx.try_iter().last() {
-                self.last = r;
+            for r in self.rx.try_iter() {
+                self.last = [std::mem::take(&mut self.last[1]), r];
             }
-            for (g, r) in gpus.iter_mut().zip(&self.last) {
+            let [older, newer] = &self.last;
+            for (g, r) in gpus.iter_mut().zip(steady(older, newer)) {
                 g.util = r.util;
                 g.mem_used = r.mem_used.unwrap_or(0);
             }
@@ -87,6 +90,22 @@ pub struct Reading {
     pub util: Option<u32>,
     pub mem_used: Option<u64>,
     pub cores: Option<u32>,
+}
+
+/// The newer readings, but each GPU's use the higher of the two. When two
+/// programs read the IORegistry at once, macOS gives one of them 0% for a
+/// busy GPU; taking the higher of two readings, half a second apart, hides
+/// that, while an idle GPU, 0% in both, still reads 0.
+pub fn steady(older: &[Reading], newer: &[Reading]) -> Vec<Reading> {
+    newer
+        .iter()
+        .enumerate()
+        .map(|(i, r)| Reading {
+            util: r.util.max(older.get(i).and_then(|o| o.util)),
+            name: r.name.clone(),
+            ..*r
+        })
+        .collect()
 }
 
 /// The GPUs in `ioreg -r -d 1 -w 0 -c IOAccelerator`'s output.
@@ -157,6 +176,26 @@ mod tests {
         assert_eq!(r[0].name, "AMDRadeonX6000");
         assert_eq!(r[0].util, Some(3));
         assert_eq!(r[0].mem_used, None);
+    }
+
+    fn util(u: u32) -> Reading {
+        Reading {
+            util: Some(u),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn hides_a_stray_zero() {
+        assert_eq!(steady(&[util(99)], &[util(0)])[0].util, Some(99));
+        assert_eq!(steady(&[util(0)], &[util(99)])[0].util, Some(99));
+    }
+
+    #[test]
+    fn reads_an_idle_gpu_as_idle() {
+        assert_eq!(steady(&[util(0)], &[util(0)])[0].util, Some(0));
+        // At first there is no older reading.
+        assert_eq!(steady(&[], &[util(7)])[0].util, Some(7));
     }
 
     #[test]
