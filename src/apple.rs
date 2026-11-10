@@ -41,6 +41,17 @@ mod source {
             .unwrap_or_default()
     }
 
+    /// The GPUs' readings, read again a moment later if they look like
+    /// they collided with another program's, given the last ones.
+    fn read_settled(prev: &[Reading]) -> Vec<Reading> {
+        let r = ioreg();
+        if !collided(prev, &r) {
+            return r;
+        }
+        std::thread::sleep(AGAIN);
+        ioreg()
+    }
+
     impl Source {
         pub fn open() -> Result<(Self, String, Vec<Gpu>), String> {
             let last = ioreg();
@@ -65,11 +76,7 @@ mod source {
             let mut prev = last.clone();
             std::thread::spawn(move || {
                 loop {
-                    let mut r = ioreg();
-                    if collided(&prev, &r) {
-                        std::thread::sleep(AGAIN);
-                        r = ioreg();
-                    }
+                    let r = read_settled(&prev);
                     if tx.send(r.clone()).is_err() {
                         break;
                     }
@@ -109,7 +116,10 @@ pub struct Reading {
 pub fn collided(prev: &[Reading], next: &[Reading]) -> bool {
     next.len() != prev.len()
         || next.iter().zip(prev).any(|(n, p)| {
-            n.mem_used.is_none() || (n.util == Some(0) && p.util.is_some_and(|u| u > 0))
+            // Statistics left out, where they were there before: a GPU
+            // whose driver never gives them is not read twice each time.
+            (n.mem_used.is_none() && p.mem_used.is_some())
+                || (n.util == Some(0) && p.util.is_some_and(|u| u > 0))
         })
 }
 
@@ -200,8 +210,13 @@ mod tests {
     fn missing_statistics_are_read_again() {
         let mut r = reading(50);
         r.mem_used = None;
-        assert!(collided(&[reading(50)], &[r]));
+        assert!(collided(&[reading(50)], std::slice::from_ref(&r)));
         assert!(collided(&[reading(50)], &[]));
+        // Never given, so not read again.
+        assert!(!collided(
+            std::slice::from_ref(&r),
+            std::slice::from_ref(&r)
+        ));
     }
 
     #[test]

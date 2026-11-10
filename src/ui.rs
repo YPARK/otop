@@ -159,12 +159,7 @@ fn draw_cpu(f: &mut Frame, app: &App, area: Rect, tall: bool) {
     let cores = if tall {
         let (chart, divider, cores) = cpu_layout(s.cores.len() as u16, inner);
         draw_history(f, chart, &s.hist_cpu, Color::Cyan);
-        if let Some(d) = divider {
-            let side = if d.width == 1 {
-                Borders::LEFT
-            } else {
-                Borders::TOP
-            };
+        if let Some((d, side)) = divider {
             f.render_widget(Block::new().borders(side).dark_gray(), d);
         }
         cores
@@ -186,7 +181,7 @@ fn draw_cpu(f: &mut Frame, app: &App, area: Rect, tall: bool) {
 /// over a few rows of a bar per CPU; the divider is a column or a row
 /// between them, so the chart's line does not run into the bars. Without
 /// CPUs, the chart alone.
-fn cpu_layout(n: u16, inner: Rect) -> (Rect, Option<Rect>, Rect) {
+fn cpu_layout(n: u16, inner: Rect) -> (Rect, Option<(Rect, Borders)>, Rect) {
     const CHART: u16 = 20;
     if n == 0 {
         return (inner, None, Rect::default());
@@ -203,16 +198,18 @@ fn cpu_layout(n: u16, inner: Rect) -> (Rect, Option<Rect>, Rect) {
     } else {
         bars
     };
-    let (dir, last) = if side + 1 + CHART <= inner.width {
-        (Direction::Horizontal, Constraint::Length(side))
+    let (dir, last, border) = if side + 1 + CHART <= inner.width {
+        (
+            Direction::Horizontal,
+            Constraint::Length(side),
+            Borders::LEFT,
+        )
     } else {
-        (Direction::Vertical, Constraint::Length(3))
+        (Direction::Vertical, Constraint::Length(3), Borders::TOP)
     };
-    let [chart, divider, cores] = Layout::default()
-        .direction(dir)
-        .constraints([Constraint::Min(0), Constraint::Length(1), last])
-        .areas(inner);
-    (chart, Some(divider), cores)
+    let [chart, divider, cores] =
+        Layout::new(dir, [Constraint::Min(0), Constraint::Length(1), last]).areas(inner);
+    (chart, Some((divider, border)), cores)
 }
 
 /// Columns a gauge per CPU takes, labelled.
@@ -846,7 +843,8 @@ mod tests {
     fn cpus_beside_the_chart_where_it_keeps_its_width() {
         // A 10-CPU Mac's panel at 80 columns.
         let (chart, divider, cores) = cpu_layout(10, Rect::new(0, 0, 46, 8));
-        let d = divider.unwrap();
+        let (d, side) = divider.unwrap();
+        assert_eq!(side, Borders::LEFT);
         assert_eq!((d.width, d.height), (1, 8));
         assert!(chart.width >= 20);
         assert_eq!(chart.right(), d.x);
@@ -856,7 +854,8 @@ mod tests {
     #[test]
     fn cpus_under_the_chart_where_they_do_not_fit_beside_it() {
         let (chart, divider, cores) = cpu_layout(64, Rect::new(0, 0, 56, 8));
-        let d = divider.unwrap();
+        let (d, side) = divider.unwrap();
+        assert_eq!(side, Borders::TOP);
         assert_eq!((d.width, d.height), (56, 1));
         assert_eq!(chart.bottom(), d.y);
         assert_eq!(d.bottom(), cores.y);
