@@ -1,4 +1,4 @@
-# gputop
+# otop
 
 Monitor NVIDIA GPUs, and the processes on them, in the terminal, like
 [nvtop](https://github.com/Syllo/nvtop).
@@ -17,7 +17,7 @@ GPU memory, SM/encoder/decoder use, and command line.
 ## Install
 
 ```sh
-cargo install --git https://github.com/YPARK/gputop
+cargo install --git https://github.com/YPARK/otop
 # or, from a clone
 cargo install --path .
 ```
@@ -25,9 +25,9 @@ cargo install --path .
 ## Use
 
 ```sh
-gputop              # sample every second
-gputop -d 500       # every 500 ms
-gputop --once       # print one sample as text, and exit
+otop             # sample every second
+otop -d 500      # every 500 ms
+otop --once      # print one sample as text, and exit
 ```
 
 | Key        | Does                                          |

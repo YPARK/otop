@@ -82,7 +82,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     let s = &app.sampler;
     let line = Line::from(vec![
-        " gputop ".bold().black().on_cyan(),
+        concat!(" ", env!("CARGO_PKG_NAME"), " ")
+            .bold()
+            .black()
+            .on_cyan(),
         format!("  Driver {}  CUDA {}  ", s.driver, s.cuda).into(),
         format!(
             "{} GPU{}  ",
