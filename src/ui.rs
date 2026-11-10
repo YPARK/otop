@@ -1,16 +1,20 @@
-//! Drawing: a panel per GPU, charts of their history, and their processes.
+//! Drawing: CPUs and memory, a panel per GPU, charts of their history,
+//! and the processes, like btop.
 
-use crate::app::{App, Charts};
-use crate::gpu::{Gpu, HISTORY};
+use crate::app::{App, Charts, Mode, Only, SortBy};
+use crate::gpu::{Gpu, GpuUse};
+use crate::hist::{HISTORY, History};
+use crate::sys::frac;
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Axis, Block, Cell, Chart, Dataset, GraphType, LineGauge, Paragraph, Row, Table,
+    Axis, Bar, BarChart, BarGroup, Block, Cell, Chart, Clear, Dataset, GraphType, LineGauge,
+    Paragraph, Row, Table,
 };
-use std::collections::VecDeque;
+use std::time::Duration;
 
 const COLORS: [Color; 8] = [
     Color::Cyan,
@@ -53,60 +57,244 @@ pub fn bytes(b: u64) -> String {
     }
 }
 
+/// The GPUs a process is on, as `0,1`.
+pub fn gpu_list(g: &GpuUse) -> String {
+    let s: Vec<String> = g.gpus.iter().map(u32::to_string).collect();
+    s.join(",")
+}
+
+/// Rows of the CPU and memory panels, inside their borders.
+const TOP: u16 = 8;
+/// Rows of each GPU panel.
+const PANEL: u16 = 4;
+/// Rows the process table keeps, at least.
+const PROCS: u16 = 8;
+
 pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
-    let n = app.sampler.gpus.len().max(1);
+    let n = app.gpus.gpus.len();
     // Two columns of GPU panels where there is room for them.
     let cols = if area.width >= 140 && n > 1 { 2 } else { 1 };
-    let rows = n.div_ceil(cols) as u16;
-    let (charts, chart_cols) = chart_layout(app, area, rows * 4);
+    let panels = n.div_ceil(cols) as u16 * PANEL;
+    let top = if app.show_charts { TOP + 2 } else { 4 };
+    let (charts, chart_cols) = chart_layout(app, area, top + panels);
 
-    let [header, gpus, charts_area, procs, footer] = Layout::vertical([
+    let [header, top_area, gpus, charts_area, procs, footer] = Layout::vertical([
         Constraint::Length(1),
-        Constraint::Length(rows * 4),
+        Constraint::Length(top),
+        Constraint::Length(panels),
         Constraint::Length(charts),
-        Constraint::Min(4),
+        Constraint::Min(PROCS.min(4)),
         Constraint::Length(1),
     ])
     .areas(area);
 
     draw_header(f, app, header);
+    let [cpu, mem] = Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .areas(top_area);
+    draw_cpu(f, app, cpu);
+    draw_mem(f, app, mem);
     draw_gpus(f, app, gpus, cols);
     if charts > 0 {
         draw_charts(f, app, charts_area, chart_cols);
     }
     draw_procs(f, app, procs);
     draw_footer(f, app, footer);
+    if let Mode::Kill(pid) = app.mode {
+        draw_kill(f, app, pid);
+    }
 }
 
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
-    let s = &app.sampler;
+    let s = &app.sys;
+    let n = app.gpus.gpus.len();
+    let gpus = match n {
+        0 => format!("{}  ", app.gpus.info),
+        1 => format!("{}  1 GPU  ", app.gpus.info),
+        _ => format!("{}  {n} GPUs  ", app.gpus.info),
+    };
     let line = Line::from(vec![
         concat!(" ", env!("CARGO_PKG_NAME"), " ")
             .bold()
             .black()
             .on_cyan(),
-        format!("  Driver {}  CUDA {}  ", s.driver, s.cuda).into(),
-        format!(
-            "{} GPU{}  ",
-            s.gpus.len(),
-            if s.gpus.len() == 1 { "" } else { "s" }
-        )
-        .into(),
+        format!("  {}  ", s.host).bold(),
+        format!("up {}  ", uptime(sysinfo::System::uptime())).into(),
+        gpus.into(),
         format!("every {} ms", app.interval.as_millis()).dark_gray(),
     ]);
     f.render_widget(Paragraph::new(line), area);
 }
 
+fn uptime(secs: u64) -> String {
+    let (d, h, m) = (secs / 86400, secs / 3600 % 24, secs / 60 % 60);
+    if d > 0 {
+        format!("{d}d {h}h")
+    } else {
+        format!("{h}h {m}m")
+    }
+}
+
+fn gauge<'a>(label: String, ratio: f64) -> LineGauge<'a> {
+    LineGauge::default()
+        .label(label)
+        .ratio(ratio.clamp(0.0, 1.0))
+        .filled_style(Style::new().fg(level_color(ratio)))
+        .unfilled_style(Style::new().fg(Color::DarkGray))
+}
+
+fn draw_cpu(f: &mut Frame, app: &App, area: Rect) {
+    let s = &app.sys;
+    let block = Block::bordered()
+        .border_style(Style::new().fg(Color::Cyan))
+        .title(Line::from(vec![
+            " CPU ".cyan().bold(),
+            format!("{} ", s.cpu_brand).dark_gray(),
+        ]))
+        .title(Line::from(format!(" {:.0}% ", s.cpu)).right_aligned());
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if !app.show_charts {
+        let [total, cores] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
+        f.render_widget(
+            gauge(format!("CPU {:>3.0}%", s.cpu), s.cpu as f64 / 100.0),
+            total,
+        );
+        draw_cores(f, &s.cores, cores);
+        return;
+    }
+    let width = cores_width(s.cores.len() as u16, inner.height, inner.width);
+    let [chart, cores] =
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(width)]).areas(inner);
+    draw_history(f, chart, &s.hist_cpu, Color::Cyan);
+    draw_cores(f, &s.cores, cores);
+}
+
+/// Columns a gauge per CPU takes, labelled.
+const CELL: u16 = 16;
+
+/// Columns for `n` CPUs' use, `height` rows high, out of `avail`: labelled
+/// gauges where they fit in most of it, or else a bar each.
+fn cores_width(n: u16, height: u16, avail: u16) -> u16 {
+    let grid = n.div_ceil(height.max(1)) * CELL;
+    if grid <= avail * 6 / 10 {
+        grid
+    } else {
+        (n * 2).min(avail * 7 / 10).max(n.min(avail))
+    }
+}
+
+/// Each CPU's use: a small labelled gauge each where they fit, or else a
+/// bar each, its height its use.
+fn draw_cores(f: &mut Frame, cores: &[f32], area: Rect) {
+    let n = cores.len() as u16;
+    if area.height == 0 || n == 0 {
+        return;
+    }
+    let cols = (area.width / CELL).max(1);
+    let rows = n.div_ceil(cols);
+    if rows <= area.height {
+        for (i, &u) in cores.iter().enumerate() {
+            let (r, c) = (i as u16 % rows, i as u16 / rows);
+            let cell = Rect::new(area.x + c * CELL, area.y + r, CELL - 1, 1).intersection(area);
+            f.render_widget(gauge(format!("{i:>3} {u:>3.0}%"), u as f64 / 100.0), cell);
+        }
+        return;
+    }
+    let bars: Vec<Bar> = cores
+        .iter()
+        .map(|&u| {
+            Bar::default()
+                .value(u.round() as u64)
+                .text_value("")
+                .style(Style::new().fg(level_color(u as f64 / 100.0)))
+        })
+        .collect();
+    // A gap between bars, where there is room for one.
+    let gap = u16::from(n * 2 - 1 <= area.width);
+    f.render_widget(
+        BarChart::default()
+            .data(BarGroup::default().bars(&bars))
+            .bar_width(1)
+            .bar_gap(gap)
+            .max(100),
+        area,
+    );
+}
+
+fn draw_mem(f: &mut Frame, app: &App, area: Rect) {
+    let s = &app.sys;
+    let block = Block::bordered()
+        .border_style(Style::new().fg(Color::Magenta))
+        .title(" Memory ".magenta().bold());
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let [ram, swap, chart] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .areas(inner);
+    let mem = frac(s.mem_used, s.mem_total);
+    f.render_widget(
+        gauge(
+            format!("RAM  {}/{}", bytes(s.mem_used), bytes(s.mem_total)),
+            mem,
+        ),
+        ram,
+    );
+    f.render_widget(
+        gauge(
+            format!("SWAP {}/{}", bytes(s.swap_used), bytes(s.swap_total)),
+            frac(s.swap_used, s.swap_total),
+        ),
+        swap,
+    );
+    if app.show_charts {
+        draw_history(f, chart, &s.hist_mem, Color::Magenta);
+    }
+}
+
+/// A chart of one history, without borders or legend, for the top panels.
+fn draw_history(f: &mut Frame, area: Rect, h: &History, color: Color) {
+    let width = (area.width.saturating_sub(4) as usize * 2).clamp(10, HISTORY);
+    let data = points(h, width);
+    let chart = Chart::new(vec![
+        Dataset::default()
+            .marker(Marker::Braille)
+            .graph_type(GraphType::Line)
+            .style(Style::new().fg(color))
+            .data(&data),
+    ])
+    .x_axis(Axis::default().bounds([0.0, width as f64]))
+    .y_axis(
+        Axis::default()
+            .bounds([0.0, 100.0])
+            .labels(["0", "100"])
+            .style(Style::new().dark_gray()),
+    );
+    f.render_widget(chart, area);
+}
+
+/// A history's last `width` samples as points, the newest at `width`.
+fn points(h: &History, width: usize) -> Vec<(f64, f64)> {
+    let start = width - h.len().min(width);
+    h.last(width)
+        .enumerate()
+        .map(|(i, v)| ((start + i) as f64, v))
+        .collect()
+}
+
 fn draw_gpus(f: &mut Frame, app: &App, area: Rect, cols: usize) {
-    let gpus = &app.sampler.gpus;
+    let gpus = &app.gpus.gpus;
     let rows = gpus.len().div_ceil(cols);
-    let row_areas = Layout::vertical(vec![Constraint::Length(4); rows]).split(area);
+    let row_areas = Layout::vertical(vec![Constraint::Length(PANEL); rows]).split(area);
     for (r, row) in row_areas.iter().enumerate() {
         let cells = Layout::horizontal(vec![Constraint::Ratio(1, cols as u32); cols]).split(*row);
-        for c in 0..cols {
+        for (c, cell) in cells.iter().enumerate() {
             if let Some(g) = gpus.get(r * cols + c) {
-                draw_gpu(f, g, cells[c]);
+                draw_gpu(f, g, *cell);
             }
         }
     }
@@ -143,27 +331,25 @@ fn draw_gpu(f: &mut Frame, g: &Gpu, area: Rect) {
         Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(inner);
     let [gu, gm] =
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(gauges);
-
-    let util = g.util.unwrap_or(0) as f64 / 100.0;
     f.render_widget(
-        LineGauge::default()
-            .label(format!("GPU {:>3}%", opt(g.util)))
-            .ratio(util.clamp(0.0, 1.0))
-            .filled_style(Style::new().fg(level_color(util)))
-            .unfilled_style(Style::new().fg(Color::DarkGray)),
+        gauge(
+            format!("GPU {:>3}%", opt(g.util)),
+            g.util.unwrap_or(0) as f64 / 100.0,
+        ),
         gu,
     );
-    let mem = g.mem_frac();
     f.render_widget(
-        LineGauge::default()
-            .label(format!(" MEM {}/{}", bytes(g.mem_used), bytes(g.mem_total)))
-            .ratio(mem.clamp(0.0, 1.0))
-            .filled_style(Style::new().fg(level_color(mem)))
-            .unfilled_style(Style::new().fg(Color::DarkGray)),
+        gauge(
+            format!(" MEM {}/{}", bytes(g.mem_used), bytes(g.mem_total)),
+            g.mem_frac(),
+        ),
         gm,
     );
 
     let mut parts: Vec<String> = Vec::new();
+    if let Some(c) = g.cores {
+        parts.push(format!("{c} cores"));
+    }
     if let Some(p) = g.power {
         match g.power_limit {
             Some(l) => parts.push(format!("POW {}/{}W", p / 1000, l / 1000)),
@@ -202,16 +388,16 @@ fn rate(kb: u32) -> String {
     }
 }
 
-/// Rows of chart, and charts to a row, that fit under `panels` rows of
-/// GPU panels while leaving room for some processes; (0, 0) for none.
-fn chart_layout(app: &App, area: Rect, panels: u16) -> (u16, usize) {
-    if !app.show_charts {
+/// Rows of GPU chart, and charts to a row, that fit under `above` rows
+/// while leaving room for some processes; (0, 0) for none.
+fn chart_layout(app: &App, area: Rect, above: u16) -> (u16, usize) {
+    let n = app.gpus.gpus.len();
+    if !app.show_charts || n == 0 {
         return (0, 0);
     }
     // The header, the footer, and a table of a few processes.
-    let room = area.height.saturating_sub(panels + 2 + 8);
-    let n = app.sampler.gpus.len();
-    if app.charts != Charts::Combined && n > 0 {
+    let room = area.height.saturating_sub(above + 2 + PROCS);
+    if app.charts != Charts::Combined {
         // As many GPUs to a row as have 50 columns a chart, at most 4.
         let per_gpu = if app.charts == Charts::Split { 2 } else { 1 };
         let cols = (area.width as usize / (50 * per_gpu)).clamp(1, 4).min(n);
@@ -226,23 +412,20 @@ fn chart_layout(app: &App, area: Rect, panels: u16) -> (u16, usize) {
 }
 
 /// A line on a chart: its name, its colour, and its samples.
-type Series<'a> = (String, Color, &'a VecDeque<f64>);
+type Series<'a> = (String, Color, &'a History);
 
 fn draw_charts(f: &mut Frame, app: &App, area: Rect, cols: usize) {
-    let gpus = &app.sampler.gpus;
+    let gpus = &app.gpus.gpus;
     if cols == 0 {
         // One chart of utilisation, and one of memory, a line per GPU.
         let [left, right] =
             Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
                 .areas(area);
-        let util = gpus
-            .iter()
-            .map(|g| (format!("GPU{}", g.index), gpu_color(g.index), &g.hist_util))
-            .collect();
-        let mem = gpus
-            .iter()
-            .map(|g| (format!("GPU{}", g.index), gpu_color(g.index), &g.hist_mem))
-            .collect();
+        let lines = |pick: fn(&Gpu) -> &History| -> Vec<Series> {
+            gpus.iter()
+                .map(|g| (format!("GPU{}", g.index), gpu_color(g.index), pick(g)))
+                .collect()
+        };
         let title = |t: &str| Line::from(t.to_string());
         draw_chart(
             f,
@@ -250,15 +433,15 @@ fn draw_charts(f: &mut Frame, app: &App, area: Rect, cols: usize) {
             left,
             title(" GPU utilisation % "),
             Color::DarkGray,
-            util,
+            lines(|g| &g.hist_util),
         );
         draw_chart(
             f,
             app,
             right,
-            title(" Memory used % "),
+            title(" GPU memory used % "),
             Color::DarkGray,
-            mem,
+            lines(|g| &g.hist_mem),
         );
         return;
     }
@@ -273,10 +456,7 @@ fn draw_charts(f: &mut Frame, app: &App, area: Rect, cols: usize) {
                 continue;
             };
             let color = gpu_color(g.index);
-            let title = Line::from(vec![
-                Span::styled(format!(" GPU{} ", g.index), Style::new().fg(color).bold()),
-                Span::raw(format!("{} ", g.name)).dark_gray(),
-            ]);
+            let gpu = Span::styled(format!(" GPU{} ", g.index), Style::new().fg(color).bold());
             let util = (
                 format!("util {:>3}%", opt(g.util)),
                 Color::Green,
@@ -291,16 +471,16 @@ fn draw_charts(f: &mut Frame, app: &App, area: Rect, cols: usize) {
                 let [left, right] =
                     Layout::horizontal([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
                         .areas(*cell);
-                let gpu = Span::styled(format!(" GPU{} ", g.index), Style::new().fg(color).bold());
                 let util_title = Line::from(vec![gpu.clone(), "utilisation ".into()]);
                 let mem_title = Line::from(vec![
                     gpu,
                     "memory ".into(),
-                    Span::raw(format!("{}/{} ", bytes(g.mem_used), bytes(g.mem_total))).dark_gray(),
+                    format!("{}/{} ", bytes(g.mem_used), bytes(g.mem_total)).dark_gray(),
                 ]);
                 draw_chart(f, app, left, util_title, color, vec![util]);
                 draw_chart(f, app, right, mem_title, color, vec![mem]);
             } else {
+                let title = Line::from(vec![gpu, format!("{} ", g.name).dark_gray()]);
                 draw_chart(f, app, *cell, title, color, vec![util, mem]);
             }
         }
@@ -317,18 +497,7 @@ fn draw_chart(
 ) {
     // Braille gives two points a cell; show as many samples as fit.
     let width = (area.width.saturating_sub(8) as usize * 2).clamp(10, HISTORY);
-    let data: Vec<Vec<(f64, f64)>> = series
-        .iter()
-        .map(|(_, _, h)| {
-            let skip = h.len().saturating_sub(width);
-            let start = h.len() - skip;
-            h.iter()
-                .skip(skip)
-                .enumerate()
-                .map(|(i, &v)| ((i + width - start) as f64, v))
-                .collect()
-        })
-        .collect();
+    let data: Vec<Vec<(f64, f64)>> = series.iter().map(|(_, _, h)| points(h, width)).collect();
     let datasets: Vec<Dataset> = series
         .iter()
         .zip(&data)
@@ -367,105 +536,164 @@ fn draw_chart(
 }
 
 fn draw_procs(f: &mut Frame, app: &mut App, area: Rect) {
-    let procs = app.processes();
+    let has_gpus = !app.gpus.gpus.is_empty();
     let arrow = if app.descending { "▼" } else { "▲" };
-    let head = |label: &str, by: crate::app::SortBy| {
-        if app.sort == by {
+    let head = |label: &str, by: Option<SortBy>| {
+        if by == Some(app.sort) {
             Cell::from(format!("{label}{arrow}")).style(Style::new().fg(Color::Cyan))
         } else {
             Cell::from(label.to_string())
         }
     };
-    use crate::app::SortBy;
-    let header = Row::new(vec![
-        head("PID", SortBy::Pid),
-        head("GPU", SortBy::Gpu),
-        Cell::from("TYPE"),
-        head("USER", SortBy::User),
-        head("GPU MEM", SortBy::Mem),
-        head("SM%", SortBy::Sm),
-        Cell::from("ENC%"),
-        Cell::from("DEC%"),
-        Cell::from("COMMAND"),
-    ])
-    .style(Style::new().add_modifier(Modifier::BOLD | Modifier::REVERSED));
-
-    let rows = procs.iter().map(|p| {
-        Row::new(vec![
-            Cell::from(p.pid.to_string()),
-            Cell::from(Span::styled(
-                p.gpu.to_string(),
-                Style::new().fg(gpu_color(p.gpu)),
-            )),
-            Cell::from(p.kind.label()),
-            Cell::from(p.user.clone()),
-            Cell::from(p.mem.map_or("-".into(), bytes)),
-            Cell::from(opt(p.sm)),
-            Cell::from(opt(p.enc)),
-            Cell::from(opt(p.dec)),
-            Cell::from(p.command.clone()),
-        ])
-    });
-    let which = match app.only_gpu {
-        Some(g) => format!(" Processes on GPU{g} "),
-        None => " Processes ".into(),
-    };
-    let table = Table::new(
-        rows,
-        [
+    let mut header = vec![
+        head("PID", Some(SortBy::Pid)),
+        head("USER", Some(SortBy::User)),
+        head("CPU%", Some(SortBy::Cpu)),
+        head("MEM", Some(SortBy::Mem)),
+    ];
+    let mut widths = vec![
+        Constraint::Length(8),
+        Constraint::Length(10),
+        Constraint::Length(6),
+        Constraint::Length(7),
+    ];
+    if has_gpus {
+        header.extend([
+            head("GPU", None),
+            head("GPU MEM", Some(SortBy::GpuMem)),
+            head("SM%", Some(SortBy::Sm)),
+        ]);
+        widths.extend([
+            Constraint::Length(4),
             Constraint::Length(8),
             Constraint::Length(4),
-            Constraint::Length(4),
-            Constraint::Length(12),
-            Constraint::Length(9),
-            Constraint::Length(5),
-            Constraint::Length(5),
-            Constraint::Length(5),
-            Constraint::Min(10),
-        ],
-    )
-    .header(header)
-    .block(
-        Block::bordered()
-            .title(which)
-            .title(Line::from(format!(" {} ", procs.len())).right_aligned())
-            .border_style(Style::new().dark_gray()),
-    )
-    .row_highlight_style(Style::new().bg(Color::DarkGray))
-    .highlight_symbol("▶");
-
-    if procs.is_empty() {
-        app.table.select(None);
-    } else if app.table.selected().is_none_or(|i| i >= procs.len()) {
-        app.table.select(Some(
-            procs
-                .len()
-                .saturating_sub(1)
-                .min(app.table.selected().unwrap_or(0)),
-        ));
+        ]);
     }
+    header.push(head("COMMAND", None));
+    widths.push(Constraint::Min(10));
+    let header =
+        Row::new(header).style(Style::new().add_modifier(Modifier::BOLD | Modifier::REVERSED));
+
+    let rows = app.rows.iter().map(|r| {
+        let mut cells = vec![
+            Cell::from(r.pid.to_string()),
+            Cell::from(r.user.clone()),
+            Cell::from(format!("{:.1}", r.cpu))
+                .style(Style::new().fg(level_color(r.cpu as f64 / 100.0))),
+            Cell::from(bytes(r.mem)),
+        ];
+        if has_gpus {
+            let g = r.gpu.as_ref();
+            let color = g
+                .and_then(|g| g.gpus.first())
+                .map_or(Color::Reset, |&i| gpu_color(i));
+            cells.extend([
+                Cell::from(g.map_or(String::new(), gpu_list)).style(Style::new().fg(color)),
+                Cell::from(g.and_then(|g| g.mem).map_or(String::new(), bytes)),
+                Cell::from(
+                    g.and_then(|g| g.sm)
+                        .map_or(String::new(), |s| s.to_string()),
+                ),
+            ]);
+        }
+        cells.push(Cell::from(r.command.clone()));
+        Row::new(cells)
+    });
+
+    let mut title = vec![" Processes".bold()];
+    match app.only {
+        Only::All => {}
+        Only::AnyGpu => title.push(" on GPUs".into()),
+        Only::Gpu(g) => title.push(format!(" on GPU{g}").into()),
+    }
+    if !app.query.is_empty() {
+        title.push(format!(" matching \"{}\"", app.query).yellow());
+    }
+    title.push(" ".into());
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(
+            Block::bordered()
+                .title(Line::from(title))
+                .title(Line::from(format!(" {} ", app.rows.len())).right_aligned())
+                .border_style(Style::new().dark_gray()),
+        )
+        .row_highlight_style(Style::new().bg(Color::DarkGray))
+        .highlight_symbol("▶");
+    app.table.select(app.selected_index());
     f.render_stateful_widget(table, area, &mut app.table);
 }
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
+    if app.mode == Mode::Search {
+        let line = Line::from(vec![
+            " / ".black().on_yellow(),
+            format!(" {}", app.query).into(),
+            "█".slow_blink(),
+            "   Enter keeps it, Esc clears it".dark_gray(),
+        ]);
+        f.render_widget(Paragraph::new(line), area);
+        return;
+    }
+    if let Some((text, at)) = &app.message
+        && at.elapsed() < Duration::from_secs(4)
+    {
+        f.render_widget(Paragraph::new(format!(" {text}")).yellow(), area);
+        return;
+    }
     let key = |k: &'static str| Span::styled(k, Style::new().black().on_cyan());
-    let line = Line::from(vec![
+    let mut line = vec![
         key("q"),
         " quit  ".into(),
-        key("↑↓"),
-        " select  ".into(),
+        key("/"),
+        " search  ".into(),
+        key("k"),
+        " kill  ".into(),
         key("s"),
         format!(" sort: {}  ", app.sort.label()).into(),
         key("r"),
         " reverse  ".into(),
-        key("g"),
-        " GPU filter  ".into(),
-        key("h"),
-        " charts  ".into(),
-        key("v"),
-        format!(" charts: {}  ", app.charts.label()).into(),
-        key("+/-"),
-        " refresh".into(),
-    ]);
-    f.render_widget(Paragraph::new(line), area);
+    ];
+    if !app.gpus.gpus.is_empty() {
+        line.extend([key("g"), " GPU filter  ".into()]);
+    }
+    line.extend([key("h"), " charts  ".into()]);
+    if !app.gpus.gpus.is_empty() {
+        line.extend([key("v"), format!(" {}  ", app.charts.label()).into()]);
+    }
+    line.extend([key("+/-"), " refresh".into()]);
+    f.render_widget(Paragraph::new(Line::from(line)), area);
+}
+
+/// Asks whether to stop the process picked, over the rest.
+fn draw_kill(f: &mut Frame, app: &App, pid: u32) {
+    let row = app.rows.iter().find(|r| r.pid == pid);
+    let what = row.map_or(String::new(), |r| format!("{} {}", r.user, r.command));
+    let [area] = Layout::horizontal([Constraint::Length(64)])
+        .flex(Flex::Center)
+        .areas(f.area());
+    let [area] = Layout::vertical([Constraint::Length(6)])
+        .flex(Flex::Center)
+        .areas(area);
+    let text = vec![
+        Line::from(vec![format!("Stop process {pid}?").bold()]),
+        Line::from(what).dark_gray(),
+        Line::from(""),
+        Line::from(vec![
+            " t ".black().on_yellow(),
+            " terminate   ".into(),
+            " 9 ".black().on_red(),
+            " kill   ".into(),
+            "any other key cancels".dark_gray(),
+        ]),
+    ];
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(text).block(
+            Block::bordered()
+                .title(" Kill ".red().bold())
+                .border_style(Style::new().fg(Color::Red)),
+        ),
+        area,
+    );
 }
