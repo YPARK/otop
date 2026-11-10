@@ -1,0 +1,23 @@
+[package]
+name = "gputop"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "MIT"
+authors = ["Yongjin Park <yongjin.park@ubc.ca>"]
+description = "Monitor NVIDIA GPUs and their processes in the terminal, like nvtop"
+keywords = ["gpu", "nvidia", "monitor", "tui", "nvml"]
+categories = ["command-line-utilities"]
+repository = "https://github.com/YPARK/gputop"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.6", features = ["derive"] }
+# NVML, loaded at run time from the driver's libnvidia-ml.so: nothing in C
+# is built, and no CUDA toolkit is needed.
+nvml-wrapper = "0.13"
+ratatui = "0.30"
+
+[profile.release]
+lto = true
+strip = true
