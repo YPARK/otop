@@ -14,53 +14,67 @@ pub const PER_PROCESS: bool = false;
 
 #[cfg(target_os = "macos")]
 mod source {
-    use super::parse;
+    use super::{Reading, parse};
     use crate::gpu::{Gpu, GpuUse};
     use std::collections::HashMap;
     use std::process::Command;
+    use std::sync::mpsc::{Receiver, channel};
+    use std::time::Duration;
 
+    /// How often `ioreg` is run.
+    const EVERY: Duration = Duration::from_millis(500);
+
+    /// The GPUs' readings, from `ioreg` run on a thread of its own, since
+    /// running it takes tens of milliseconds.
     pub struct Source {
-        mem_total: u64,
+        rx: Receiver<Vec<Reading>>,
+        last: Vec<Reading>,
     }
 
-    fn ioreg() -> Result<String, String> {
-        let out = Command::new("ioreg")
+    fn ioreg() -> Vec<Reading> {
+        Command::new("ioreg")
             .args(["-r", "-d", "1", "-w", "0", "-c", "IOAccelerator"])
             .output()
-            .map_err(|e| format!("cannot run ioreg: {e}"))?;
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+            .map(|o| parse(&String::from_utf8_lossy(&o.stdout)))
+            .unwrap_or_default()
     }
 
     impl Source {
         pub fn open() -> Result<(Self, String, Vec<Gpu>), String> {
-            let readings = parse(&ioreg()?);
-            if readings.is_empty() {
+            let last = ioreg();
+            if last.is_empty() {
                 return Err("no GPU in the IORegistry".into());
             }
+            // Apple's GPUs share the system's memory.
             let mut sys = sysinfo::System::new();
             sys.refresh_memory();
-            let source = Source {
-                mem_total: sys.total_memory(),
-            };
-            let gpus = readings
-                .into_iter()
+            let gpus = last
+                .iter()
                 .enumerate()
                 .map(|(i, r)| Gpu {
                     index: i as u32,
-                    name: r.name,
+                    name: r.name.clone(),
                     cores: r.cores,
+                    mem_total: sys.total_memory(),
                     ..Default::default()
                 })
                 .collect();
-            Ok((source, "Apple GPU".into(), gpus))
+            let (tx, rx) = channel();
+            std::thread::spawn(move || {
+                while tx.send(ioreg()).is_ok() {
+                    std::thread::sleep(EVERY);
+                }
+            });
+            Ok((Source { rx, last }, "Apple GPU".into(), gpus))
         }
 
         pub fn sample(&mut self, gpus: &mut [Gpu], _: &mut HashMap<u32, GpuUse>) {
-            let Ok(out) = ioreg() else { return };
-            for (g, r) in gpus.iter_mut().zip(parse(&out)) {
+            if let Some(r) = self.rx.try_iter().last() {
+                self.last = r;
+            }
+            for (g, r) in gpus.iter_mut().zip(&self.last) {
                 g.util = r.util;
                 g.mem_used = r.mem_used.unwrap_or(0);
-                g.mem_total = self.mem_total;
             }
         }
     }

@@ -46,7 +46,7 @@ fn main() -> anyhow::Result<()> {
     );
     if args.once {
         // Piped into `head`, say, stdout may close early; that is not an error.
-        return match app::print_once(&app, &mut std::io::stdout().lock()) {
+        return match ui::print_once(&app, &mut std::io::stdout().lock()) {
             Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
             r => Ok(r?),
         };

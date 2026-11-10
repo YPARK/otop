@@ -11,9 +11,10 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Axis, Bar, BarChart, BarGroup, Block, Cell, Chart, Clear, Dataset, GraphType, LineGauge,
-    Paragraph, Row, Table,
+    Axis, Bar, BarChart, BarGroup, Block, Cell, Chart, Clear, Dataset, GraphType, LegendPosition,
+    LineGauge, Paragraph, Row, Table, TableState,
 };
+use std::io::{self, Write};
 use std::time::Duration;
 
 const COLORS: [Color; 8] = [
@@ -80,14 +81,14 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // for the processes.
     let tall = app.show_charts && area.height >= 30;
     let top = if tall { TOP + 2 } else { 4 };
-    let (charts, chart_cols) = chart_layout(app, area, top + panels);
+    let (charts, layout) = chart_layout(app, area, top + panels);
 
     let [header, top_area, gpus, charts_area, procs, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(top),
         Constraint::Length(panels),
         Constraint::Length(charts),
-        Constraint::Min(PROCS.min(4)),
+        Constraint::Min(4),
         Constraint::Length(1),
     ])
     .areas(area);
@@ -98,9 +99,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_cpu(f, app, cpu, tall);
     draw_mem(f, app, mem, tall);
     draw_gpus(f, app, gpus, cols);
-    if charts > 0 {
-        draw_charts(f, app, charts_area, chart_cols);
-    }
+    draw_charts(f, app, charts_area, layout);
     draw_procs(f, app, procs);
     draw_footer(f, app, footer);
     if let Mode::Kill(pid, _) = app.mode {
@@ -157,18 +156,20 @@ fn draw_cpu(f: &mut Frame, app: &App, area: Rect, tall: bool) {
         .title(Line::from(format!(" {:.0}% ", s.cpu)).right_aligned());
     let inner = block.inner(area);
     f.render_widget(block, area);
-    if !tall {
+    let cores = if tall {
+        let (chart, cores) = cpu_layout(s.cores.len() as u16, inner);
+        draw_history(f, chart, &s.hist_cpu, Color::Cyan);
+        cores
+    } else {
+        // No chart: the total as a gauge, over the CPUs.
         let [total, cores] =
             Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
         f.render_widget(
             gauge(format!("CPU {:>3.0}%", s.cpu), s.cpu as f64 / 100.0),
             total,
         );
-        draw_cores(f, &s.cores, cores);
-        return;
-    }
-    let (chart, cores) = cpu_layout(s.cores.len() as u16, inner);
-    draw_history(f, chart, &s.hist_cpu, Color::Cyan);
+        cores
+    };
     draw_cores(f, &s.cores, cores);
 }
 
@@ -277,25 +278,44 @@ fn draw_mem(f: &mut Frame, app: &App, area: Rect, tall: bool) {
     }
 }
 
+/// How many samples fit in `area`, less `margin` columns for the axis:
+/// Braille gives two points a cell.
+fn samples(area: Rect, margin: u16) -> usize {
+    (area.width.saturating_sub(margin) as usize * 2).clamp(10, HISTORY)
+}
+
+/// A line chart from 0 to 100% of the last `width` samples.
+fn line_chart<'a>(datasets: Vec<Dataset<'a>>, width: usize, y: &'a [&'a str]) -> Chart<'a> {
+    Chart::new(datasets)
+        .x_axis(
+            Axis::default()
+                .bounds([0.0, width as f64])
+                .style(Style::new().dark_gray()),
+        )
+        .y_axis(
+            Axis::default()
+                .bounds([0.0, 100.0])
+                .labels(y.iter().copied())
+                .style(Style::new().dark_gray()),
+        )
+}
+
+fn line<'a>(color: Color, data: &'a [(f64, f64)]) -> Dataset<'a> {
+    Dataset::default()
+        .marker(Marker::Braille)
+        .graph_type(GraphType::Line)
+        .style(Style::new().fg(color))
+        .data(data)
+}
+
 /// A chart of one history, without borders or legend, for the top panels.
 fn draw_history(f: &mut Frame, area: Rect, h: &History, color: Color) {
-    let width = (area.width.saturating_sub(4) as usize * 2).clamp(10, HISTORY);
+    let width = samples(area, 4);
     let data = points(h, width);
-    let chart = Chart::new(vec![
-        Dataset::default()
-            .marker(Marker::Braille)
-            .graph_type(GraphType::Line)
-            .style(Style::new().fg(color))
-            .data(&data),
-    ])
-    .x_axis(Axis::default().bounds([0.0, width as f64]))
-    .y_axis(
-        Axis::default()
-            .bounds([0.0, 100.0])
-            .labels(["0", "100"])
-            .style(Style::new().dark_gray()),
+    f.render_widget(
+        line_chart(vec![line(color, &data)], width, &["0", "100"]),
+        area,
     );
-    f.render_widget(chart, area);
 }
 
 /// A history's last `width` samples as points, the newest at `width`.
@@ -307,17 +327,26 @@ fn points(h: &History, width: usize) -> Vec<(f64, f64)> {
         .collect()
 }
 
+/// `n` cells, `cols` to a row, each row `row` high.
+fn grid(area: Rect, n: usize, cols: usize, row: Constraint) -> Vec<Rect> {
+    let rows = Layout::vertical(vec![row; n.div_ceil(cols)]).split(area);
+    rows.iter()
+        .flat_map(|r| {
+            Layout::horizontal(vec![Constraint::Ratio(1, cols as u32); cols])
+                .split(*r)
+                .to_vec()
+        })
+        .take(n)
+        .collect()
+}
+
 fn draw_gpus(f: &mut Frame, app: &App, area: Rect, cols: usize) {
     let gpus = &app.gpus.gpus;
-    let rows = gpus.len().div_ceil(cols);
-    let row_areas = Layout::vertical(vec![Constraint::Length(PANEL); rows]).split(area);
-    for (r, row) in row_areas.iter().enumerate() {
-        let cells = Layout::horizontal(vec![Constraint::Ratio(1, cols as u32); cols]).split(*row);
-        for (c, cell) in cells.iter().enumerate() {
-            if let Some(g) = gpus.get(r * cols + c) {
-                draw_gpu(f, g, *cell);
-            }
-        }
+    for (g, cell) in gpus
+        .iter()
+        .zip(grid(area, gpus.len(), cols, Constraint::Length(PANEL)))
+    {
+        draw_gpu(f, g, cell);
     }
 }
 
@@ -373,8 +402,8 @@ fn draw_gpu(f: &mut Frame, g: &Gpu, area: Rect) {
     }
     if let Some(p) = g.power {
         match g.power_limit {
-            Some(l) => parts.push(format!("POW {}/{}W", p / 1000, l / 1000)),
-            None => parts.push(format!("POW {}W", p / 1000)),
+            Some(l) => parts.push(format!("POW {p}/{l}W")),
+            None => parts.push(format!("POW {p}W")),
         }
     }
     if let Some(fan) = g.fan {
@@ -398,23 +427,35 @@ fn draw_gpu(f: &mut Frame, g: &Gpu, area: Rect) {
     f.render_widget(Paragraph::new(parts.join("  ")).dark_gray(), stats);
 }
 
-/// PCIe throughput, which NVML gives in KB/s.
-fn rate(kb: u32) -> String {
-    if kb >= 1024 * 1024 {
-        format!("{:.1}GB/s", kb as f64 / (1024.0 * 1024.0))
-    } else if kb >= 1024 {
-        format!("{:.0}MB/s", kb as f64 / 1024.0)
+/// A throughput, given in bytes per second.
+fn rate(b: u64) -> String {
+    const K: f64 = 1024.0;
+    let b = b as f64;
+    if b >= K * K * K {
+        format!("{:.1}GB/s", b / (K * K * K))
+    } else if b >= K * K {
+        format!("{:.0}MB/s", b / (K * K))
     } else {
-        format!("{kb}KB/s")
+        format!("{:.0}KB/s", b / K)
     }
 }
 
-/// Rows of GPU chart, and charts to a row, that fit under `above` rows
-/// while leaving room for some processes; (0, 0) for none.
-fn chart_layout(app: &App, area: Rect, above: u16) -> (u16, usize) {
+/// How the GPUs' charts are laid out, as there is room.
+#[derive(Clone, Copy)]
+enum GpuCharts {
+    None,
+    /// For each GPU, `cols` GPUs to a row, as `Charts` says.
+    PerGpu(usize),
+    /// One chart of every GPU's utilisation, and one of their memory.
+    Combined,
+}
+
+/// Rows of GPU chart, and how they are laid out, that fit under `above`
+/// rows while leaving room for some processes.
+fn chart_layout(app: &App, area: Rect, above: u16) -> (u16, GpuCharts) {
     let n = app.gpus.gpus.len();
     if !app.show_charts || n == 0 {
-        return (0, 0);
+        return (0, GpuCharts::None);
     }
     // The header, the footer, and a table of a few processes.
     let room = area.height.saturating_sub(above + 2 + PROCS);
@@ -426,132 +467,118 @@ fn chart_layout(app: &App, area: Rect, above: u16) -> (u16, usize) {
         // Each chart 10 rows high, or less, down to 7, to fit them all.
         let per = (room / rows).min(10);
         if per >= 7 {
-            return (per * rows, cols);
+            return (per * rows, GpuCharts::PerGpu(cols));
         }
     }
-    if room >= 8 { (room.min(12), 0) } else { (0, 0) }
+    if room >= 8 {
+        (room.min(12), GpuCharts::Combined)
+    } else {
+        (0, GpuCharts::None)
+    }
 }
 
 /// A line on a chart: its name, its colour, and its samples.
 type Series<'a> = (String, Color, &'a History);
 
-fn draw_charts(f: &mut Frame, app: &App, area: Rect, cols: usize) {
+fn draw_charts(f: &mut Frame, app: &App, area: Rect, layout: GpuCharts) {
     let gpus = &app.gpus.gpus;
-    if cols == 0 {
-        // One chart of utilisation, and one of memory, a line per GPU.
-        let [left, right] =
-            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .areas(area);
-        let lines = |pick: fn(&Gpu) -> &History| -> Vec<Series> {
-            gpus.iter()
-                .map(|g| (format!("GPU{}", g.index), gpu_color(g.index), pick(g)))
-                .collect()
-        };
-        let title = |t: &str| Line::from(t.to_string());
-        draw_chart(
-            f,
-            left,
-            title(" GPU utilisation % "),
-            Color::DarkGray,
-            lines(|g| &g.hist_util),
-        );
-        draw_chart(
-            f,
-            right,
-            title(" GPU memory used % "),
-            Color::DarkGray,
-            lines(|g| &g.hist_mem),
-        );
-        return;
-    }
-    // For each GPU, a chart of its utilisation and its memory, or one of
-    // each.
-    let rows = gpus.len().div_ceil(cols);
-    let row_areas = Layout::vertical(vec![Constraint::Ratio(1, rows as u32); rows]).split(area);
-    for (r, row) in row_areas.iter().enumerate() {
-        let cells = Layout::horizontal(vec![Constraint::Ratio(1, cols as u32); cols]).split(*row);
-        for (c, cell) in cells.iter().enumerate() {
-            let Some(g) = gpus.get(r * cols + c) else {
-                continue;
+    let cols = match layout {
+        GpuCharts::None => return,
+        GpuCharts::PerGpu(cols) => cols,
+        GpuCharts::Combined => {
+            let [left, right] =
+                Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                    .areas(area);
+            let lines = |pick: fn(&Gpu) -> &History| -> Vec<Series> {
+                gpus.iter()
+                    .map(|g| (format!("GPU{}", g.index), gpu_color(g.index), pick(g)))
+                    .collect()
             };
-            let color = gpu_color(g.index);
-            let gpu = Span::styled(format!(" GPU{} ", g.index), Style::new().fg(color).bold());
-            let util = (
-                format!("util {:>3}%", opt(g.util)),
-                Color::Green,
-                &g.hist_util,
+            let all = Color::DarkGray;
+            draw_chart(
+                f,
+                left,
+                " GPU utilisation % ".into(),
+                all,
+                lines(|g| &g.hist_util),
             );
-            let mem = (
-                format!("mem {:>3.0}%", 100.0 * g.mem_frac()),
-                Color::Magenta,
-                &g.hist_mem,
+            draw_chart(
+                f,
+                right,
+                " GPU memory used % ".into(),
+                all,
+                lines(|g| &g.hist_mem),
             );
-            if app.charts == Charts::Split {
-                let [left, right] =
-                    Layout::horizontal([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
-                        .areas(*cell);
-                let util_title = Line::from(vec![gpu.clone(), "utilisation ".into()]);
-                let mem_title = Line::from(vec![
-                    gpu,
-                    "memory ".into(),
-                    format!("{}/{} ", bytes(g.mem_used), bytes(g.mem_total)).dark_gray(),
-                ]);
-                draw_chart(f, left, util_title, color, vec![util]);
-                draw_chart(f, right, mem_title, color, vec![mem]);
-            } else {
-                let title = Line::from(vec![gpu, format!("{} ", g.name).dark_gray()]);
-                draw_chart(f, *cell, title, color, vec![util, mem]);
-            }
+            return;
+        }
+    };
+    let rows = gpus.len().div_ceil(cols) as u32;
+    for (g, cell) in gpus
+        .iter()
+        .zip(grid(area, gpus.len(), cols, Constraint::Ratio(1, rows)))
+    {
+        let color = gpu_color(g.index);
+        let gpu = Span::styled(format!(" GPU{} ", g.index), Style::new().fg(color).bold());
+        let util = (
+            format!("util {:>3}%", opt(g.util)),
+            Color::Green,
+            &g.hist_util,
+        );
+        let mem = (
+            format!("mem {:>3.0}%", 100.0 * g.mem_frac()),
+            Color::Magenta,
+            &g.hist_mem,
+        );
+        if app.charts == Charts::Split {
+            let [left, right] =
+                Layout::horizontal([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)]).areas(cell);
+            let util_title = Line::from(vec![gpu.clone(), "utilisation ".into()]);
+            let mem_title = Line::from(vec![
+                gpu,
+                "memory ".into(),
+                format!("{}/{} ", bytes(g.mem_used), bytes(g.mem_total)).dark_gray(),
+            ]);
+            draw_chart(f, left, util_title, color, vec![util]);
+            draw_chart(f, right, mem_title, color, vec![mem]);
+        } else {
+            let title = Line::from(vec![gpu, format!("{} ", g.name).dark_gray()]);
+            draw_chart(f, cell, title, color, vec![util, mem]);
         }
     }
 }
 
 fn draw_chart(f: &mut Frame, area: Rect, title: Line, border: Color, series: Vec<Series>) {
-    // Braille gives two points a cell; show as many samples as fit.
-    let width = (area.width.saturating_sub(8) as usize * 2).clamp(10, HISTORY);
+    let width = samples(area, 8);
     let data: Vec<Vec<(f64, f64)>> = series.iter().map(|(_, _, h)| points(h, width)).collect();
-    let datasets: Vec<Dataset> = series
+    let datasets = series
         .iter()
         .zip(&data)
-        .map(|((name, color, _), d)| {
-            Dataset::default()
-                .name(name.clone())
-                .marker(Marker::Braille)
-                .graph_type(GraphType::Line)
-                .style(Style::new().fg(*color))
-                .data(d)
-        })
+        .map(|((name, color, _), d)| line(*color, d).name(name.clone()))
         .collect();
     let span = series
         .first()
         .map_or(0, |(_, _, h)| h.span(width).as_secs());
-    let chart = Chart::new(datasets)
+    let mut chart = line_chart(datasets, width, &["0", "50", "100"])
         .block(
             Block::bordered()
                 .title(title)
                 .border_style(Style::new().fg(border)),
         )
-        .x_axis(
-            Axis::default()
-                .bounds([0.0, width as f64])
-                .labels([format!("-{span}s"), "now".into()])
-                .style(Style::new().dark_gray()),
-        )
-        .y_axis(
-            Axis::default()
-                .bounds([0.0, 100.0])
-                .labels(["0", "50", "100"])
-                .style(Style::new().dark_gray()),
-        )
-        .legend_position(Some(ratatui::widgets::LegendPosition::TopLeft))
+        .legend_position(Some(LegendPosition::TopLeft))
         // Show the legend however small the chart is.
         .hidden_legend_constraints((Constraint::Min(0), Constraint::Min(0)));
+    chart = chart.x_axis(
+        Axis::default()
+            .bounds([0.0, width as f64])
+            .labels([format!("-{span}s"), "now".into()])
+            .style(Style::new().dark_gray()),
+    );
     f.render_widget(chart, area);
 }
 
 fn draw_procs(f: &mut Frame, app: &mut App, area: Rect) {
     // GPU columns where the GPUs' source says which process uses them.
-    let has_gpus = app.gpus.per_process && !app.gpus.gpus.is_empty();
+    let has_gpus = app.gpus.per_process();
     let arrow = if app.descending { "▼" } else { "▲" };
     let head = |label: &str, by: Option<SortBy>| {
         if by == Some(app.sort) {
@@ -589,16 +616,29 @@ fn draw_procs(f: &mut Frame, app: &mut App, area: Rect) {
     let header =
         Row::new(header).style(Style::new().add_modifier(Modifier::BOLD | Modifier::REVERSED));
 
-    let rows = app.rows.iter().map(|r| {
+    // Rows for those on screen alone, scrolled to keep the one picked in
+    // sight: inside the borders, under the header.
+    let height = area.height.saturating_sub(3) as usize;
+    let selected = app.selected();
+    if let Some(i) = selected {
+        if i < app.offset {
+            app.offset = i;
+        } else if i >= app.offset + height {
+            app.offset = i + 1 - height;
+        }
+    }
+    app.offset = app.offset.min(app.rows.len().saturating_sub(height));
+    let shown = app.offset..(app.offset + height).min(app.rows.len());
+    let rows = shown.clone().map(|i| {
+        let (p, g) = app.row(i);
         let mut cells = vec![
-            Cell::from(r.pid.to_string()),
-            Cell::from(r.user.clone()),
-            Cell::from(format!("{:.1}", r.cpu))
-                .style(Style::new().fg(level_color(r.cpu as f64 / 100.0))),
-            Cell::from(bytes(r.mem)),
+            Cell::from(p.pid.to_string()),
+            Cell::from(&*p.user),
+            Cell::from(format!("{:.1}", p.cpu))
+                .style(Style::new().fg(level_color(p.cpu as f64 / 100.0))),
+            Cell::from(bytes(p.mem)),
         ];
         if has_gpus {
-            let g = r.gpu.as_ref();
             let color = g
                 .and_then(|g| g.gpus.first())
                 .map_or(Color::Reset, |&i| gpu_color(i));
@@ -611,7 +651,7 @@ fn draw_procs(f: &mut Frame, app: &mut App, area: Rect) {
                 ),
             ]);
         }
-        cells.push(Cell::from(r.command.clone()));
+        cells.push(Cell::from(p.command.as_str()));
         Row::new(cells)
     });
 
@@ -635,8 +675,8 @@ fn draw_procs(f: &mut Frame, app: &mut App, area: Rect) {
         )
         .row_highlight_style(Style::new().bg(Color::DarkGray))
         .highlight_symbol("▶");
-    app.table.select(app.selected_index());
-    f.render_stateful_widget(table, area, &mut app.table);
+    let mut state = TableState::default().with_selected(selected.map(|i| i - shown.start));
+    f.render_stateful_widget(table, area, &mut state);
 }
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
@@ -657,7 +697,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
     // The keys, most wanted first, as many as fit.
-    let gpu = app.gpus.per_process && !app.gpus.gpus.is_empty();
+    let gpu = app.gpus.per_process();
     let charts = !app.gpus.gpus.is_empty();
     let mut hints: Vec<(&str, String)> = vec![
         ("q", "quit".into()),
@@ -673,24 +713,27 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         hints.push(("v", app.charts.label().into()));
     }
     hints.extend([("r", "reverse".into()), ("+/-", "refresh".into())]);
-    let mut line = Vec::new();
-    let mut used = 0;
+    let mut line = Line::default();
     for (k, what) in hints {
-        let w = k.chars().count() + what.chars().count() + 3;
-        if used + w > area.width as usize {
+        let key = Span::styled(k, Style::new().black().on_cyan());
+        let what = Span::raw(format!(" {what}  "));
+        if line.width() + key.width() + what.width() > area.width as usize {
             break;
         }
-        used += w;
-        line.push(Span::styled(k, Style::new().black().on_cyan()));
-        line.push(format!(" {what}  ").into());
+        line.push_span(key);
+        line.push_span(what);
     }
-    f.render_widget(Paragraph::new(Line::from(line)), area);
+    f.render_widget(Paragraph::new(line), area);
 }
 
 /// Asks whether to stop the process picked, over the rest.
 fn draw_kill(f: &mut Frame, app: &App, pid: u32) {
-    let row = app.rows.iter().find(|r| r.pid == pid);
-    let what = row.map_or(String::new(), |r| format!("{} {}", r.user, r.command));
+    let what = app
+        .sys
+        .procs
+        .iter()
+        .find(|p| p.pid == pid)
+        .map_or(String::new(), |p| format!("{} {}", p.user, p.command));
     let [area] = Layout::horizontal([Constraint::Length(64)])
         .flex(Flex::Center)
         .areas(f.area());
@@ -718,4 +761,68 @@ fn draw_kill(f: &mut Frame, app: &App, pid: u32) {
         ),
         area,
     );
+}
+
+/// `--once`: the CPUs, memory, GPUs and busiest processes, as plain text,
+/// with the same columns as the table.
+pub fn print_once(app: &App, out: &mut impl Write) -> io::Result<()> {
+    let (sys, gpus) = (&app.sys, &app.gpus);
+    writeln!(
+        out,
+        "{}  {}  CPU {:.0}%  MEM {}/{}  SWAP {}/{}",
+        sys.host,
+        sys.cpu_brand,
+        sys.cpu,
+        bytes(sys.mem_used),
+        bytes(sys.mem_total),
+        bytes(sys.swap_used),
+        bytes(sys.swap_total),
+    )?;
+    writeln!(out, "{}", gpus.info)?;
+    for g in &gpus.gpus {
+        writeln!(
+            out,
+            "GPU{} {:<28} util {:>3}%  mem {}/{}  {}  {}",
+            g.index,
+            g.name,
+            opt(g.util),
+            bytes(g.mem_used),
+            bytes(g.mem_total),
+            g.temp.map_or("-".into(), |t| format!("{t}°C")),
+            g.power.map_or("-".into(), |p| format!("{p}W")),
+        )?;
+    }
+    let has_gpus = gpus.per_process();
+    writeln!(out)?;
+    write!(
+        out,
+        "{:>8} {:<10} {:>6} {:>8}",
+        "PID", "USER", "CPU%", "MEM"
+    )?;
+    if has_gpus {
+        write!(out, " {:>5} {:>8} {:>4}", "GPU", "GPU MEM", "SM%")?;
+    }
+    writeln!(out, "  COMMAND")?;
+    for i in 0..app.rows.len().min(20) {
+        let (p, g) = app.row(i);
+        write!(
+            out,
+            "{:>8} {:<10} {:>6.1} {:>8}",
+            p.pid,
+            p.user,
+            p.cpu,
+            bytes(p.mem)
+        )?;
+        if has_gpus {
+            write!(
+                out,
+                " {:>5} {:>8} {:>4}",
+                g.map_or("-".into(), gpu_list),
+                g.and_then(|g| g.mem).map_or("-".into(), bytes),
+                opt(g.and_then(|g| g.sm)),
+            )?;
+        }
+        writeln!(out, "  {}", p.command)?;
+    }
+    Ok(())
 }

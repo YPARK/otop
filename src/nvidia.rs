@@ -32,14 +32,22 @@ impl Source {
             .map(|v| format!("{}.{}", v / 1000, (v % 1000) / 10))
             .unwrap_or_else(|_| "?".into());
         let n = nvml.device_count().map_err(|e| e.to_string())?;
+        // What does not change, read once.
         let gpus = (0..n)
-            .map(|i| Gpu {
-                index: i,
-                name: nvml
-                    .device_by_index(i)
-                    .and_then(|d| d.name())
-                    .unwrap_or_else(|_| "unknown".into()),
-                ..Default::default()
+            .map(|i| {
+                let d = nvml.device_by_index(i);
+                let d = d.as_ref().ok();
+                Gpu {
+                    index: i,
+                    name: d
+                        .and_then(|d| d.name().ok())
+                        .unwrap_or_else(|| "unknown".into()),
+                    power_limit: d
+                        .and_then(|d| d.enforced_power_limit().ok())
+                        .map(|mw| mw / 1000),
+                    clock_gr_max: d.and_then(|d| d.max_clock_info(Clock::Graphics).ok()),
+                    ..Default::default()
+                }
             })
             .collect();
         let source = Source {
@@ -61,14 +69,14 @@ impl Source {
                 g.mem_total = m.total;
             }
             g.temp = d.temperature(TemperatureSensor::Gpu).ok();
-            g.power = d.power_usage().ok();
-            g.power_limit = d.enforced_power_limit().ok();
+            // NVML gives milliwatts and KB/s.
+            g.power = d.power_usage().ok().map(|mw| mw / 1000);
             g.fan = d.fan_speed(0).ok();
             g.clock_gr = d.clock_info(Clock::Graphics).ok();
-            g.clock_gr_max = d.max_clock_info(Clock::Graphics).ok();
             g.clock_mem = d.clock_info(Clock::Memory).ok();
-            g.pcie_tx = d.pcie_throughput(PcieUtilCounter::Send).ok();
-            g.pcie_rx = d.pcie_throughput(PcieUtilCounter::Receive).ok();
+            let pcie = |c| d.pcie_throughput(c).ok().map(|kb| kb as u64 * 1024);
+            g.pcie_tx = pcie(PcieUtilCounter::Send);
+            g.pcie_rx = pcie(PcieUtilCounter::Receive);
             g.enc = d.encoder_utilization().ok().map(|e| e.utilization);
             g.dec = d.decoder_utilization().ok().map(|e| e.utilization);
             g.pstate = d.performance_state().ok().map(pstate);
@@ -88,19 +96,17 @@ impl Source {
             }
             let sm = &self.last_sm[i];
 
-            // A process both computing and drawing is listed twice, with
-            // the same memory; count it once on this GPU.
-            let mut seen: Vec<u32> = Vec::new();
             let lists = [
                 d.running_compute_processes(),
                 d.running_graphics_processes(),
             ];
             for p in lists.into_iter().flat_map(Result::unwrap_or_default) {
-                if seen.contains(&p.pid) {
+                let u = procs.entry(p.pid).or_default();
+                // A process both computing and drawing is listed twice,
+                // with the same memory; count it once on this GPU.
+                if u.gpus.last() == Some(&(i as u32)) {
                     continue;
                 }
-                seen.push(p.pid);
-                let u = procs.entry(p.pid).or_default();
                 u.gpus.push(i as u32);
                 if let UsedGpuMemory::Used(b) = p.used_gpu_memory {
                     u.mem = Some(u.mem.unwrap_or(0) + b);
@@ -115,25 +121,8 @@ impl Source {
 
 /// A performance state as nvidia-smi writes it: P0 is fastest, P8 idle.
 fn pstate(p: PerformanceState) -> String {
-    use PerformanceState::*;
-    let n = match p {
-        Zero => 0,
-        One => 1,
-        Two => 2,
-        Three => 3,
-        Four => 4,
-        Five => 5,
-        Six => 6,
-        Seven => 7,
-        Eight => 8,
-        Nine => 9,
-        Ten => 10,
-        Eleven => 11,
-        Twelve => 12,
-        Thirteen => 13,
-        Fourteen => 14,
-        Fifteen => 15,
-        Unknown => return "P?".into(),
-    };
-    format!("P{n}")
+    match p {
+        PerformanceState::Unknown => "P?".into(),
+        p => format!("P{}", p.as_c()),
+    }
 }
