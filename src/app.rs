@@ -244,7 +244,12 @@ impl App {
             KeyCode::Char('k') | KeyCode::F(9) => {
                 if let Some(i) = self.selected() {
                     let p = self.row(i).0;
-                    self.mode = Mode::Kill(p.pid, p.start);
+                    if crate::sys::signalable(p.pid) {
+                        self.mode = Mode::Kill(p.pid, p.start);
+                    } else {
+                        let text = format!("process {} cannot be signalled", p.pid);
+                        self.message = Some((text, Instant::now()));
+                    }
                 }
             }
             KeyCode::Down => self.step(1),

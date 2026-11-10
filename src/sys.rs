@@ -231,6 +231,11 @@ impl Sys {
     /// Sends `signal` to process `pid`, if it is still the one started at
     /// `start`; an error says why it was not sent.
     pub fn signal(&mut self, pid: u32, start: u64, signal: Signal) -> Result<(), String> {
+        // kill(0, ...) signals every process in otop's own process group,
+        // not a process 0: macOS lists its kernel as PID 0.
+        if !signalable(pid) {
+            return Err(format!("process {pid} cannot be signalled"));
+        }
         // Look again, now: the process may have ended since the last sample,
         // and its PID been given to another.
         let id = Pid::from_u32(pid);
@@ -250,6 +255,12 @@ impl Sys {
             None => Err(format!("{signal:?} is not supported here")),
         }
     }
+}
+
+/// Whether `pid` names one process to signal: 0, to kill(), is otop's own
+/// process group.
+pub fn signalable(pid: u32) -> bool {
+    pid != 0
 }
 
 /// A UID's name, from the system's user database, which, unlike the
@@ -273,5 +284,16 @@ pub fn frac(used: u64, total: u64) -> f64 {
         0.0
     } else {
         used as f64 / total as f64
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::signalable;
+
+    #[test]
+    fn pid_0_is_never_signalled() {
+        assert!(!signalable(0));
+        assert!(signalable(1));
     }
 }
