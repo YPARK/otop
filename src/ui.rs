@@ -6,14 +6,15 @@ use crate::gpu::{Gpu, GpuUse};
 use crate::hist::{HISTORY, History};
 use crate::sys::frac;
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Flex, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Axis, Bar, BarChart, BarGroup, Block, Cell, Chart, Clear, Dataset, GraphType, LegendPosition,
-    LineGauge, Paragraph, Row, Table, TableState,
+    Axis, Bar, BarChart, BarGroup, Block, Borders, Cell, Chart, Clear, Dataset, GraphType,
+    LegendPosition, LineGauge, Paragraph, Row, Table, TableState,
 };
+use std::fmt::Write as _;
 use std::io::{self, Write};
 use std::time::Duration;
 
@@ -48,13 +49,16 @@ pub fn opt(v: Option<u32>) -> String {
 }
 
 pub fn bytes(b: u64) -> String {
-    const GIB: f64 = (1u64 << 30) as f64;
-    const MIB: f64 = (1u64 << 20) as f64;
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * KIB;
+    const GIB: f64 = MIB * KIB;
     let b = b as f64;
     if b >= GIB {
         format!("{:.1}G", b / GIB)
-    } else {
+    } else if b >= MIB {
         format!("{:.0}M", b / MIB)
+    } else {
+        format!("{:.0}K", b / KIB)
     }
 }
 
@@ -123,9 +127,21 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         format!("  {}  ", s.host).bold(),
         format!("up {}  ", uptime(sysinfo::System::uptime())).into(),
         gpus.into(),
-        format!("every {} ms", app.interval.as_millis()).dark_gray(),
+        format!("every {}", interval(app.interval)).dark_gray(),
     ]);
     f.render_widget(Paragraph::new(line), area);
+}
+
+/// A refresh interval as people say it: 250 ms, 1 s, 1.5 s, 60 s.
+fn interval(d: Duration) -> String {
+    let ms = d.as_millis();
+    if ms < 1000 {
+        format!("{ms} ms")
+    } else if ms.is_multiple_of(1000) {
+        format!("{} s", ms / 1000)
+    } else {
+        format!("{:.1} s", ms as f64 / 1000.0)
+    }
 }
 
 fn uptime(secs: u64) -> String {
@@ -157,8 +173,11 @@ fn draw_cpu(f: &mut Frame, app: &App, area: Rect, tall: bool) {
     let inner = block.inner(area);
     f.render_widget(block, area);
     let cores = if tall {
-        let (chart, cores) = cpu_layout(s.cores.len() as u16, inner);
+        let (chart, divider, cores) = cpu_layout(s.cores.len() as u16, inner);
         draw_history(f, chart, &s.hist_cpu, Color::Cyan);
+        if let Some((d, side)) = divider {
+            f.render_widget(Block::new().borders(side).dark_gray(), d);
+        }
         cores
     } else {
         // No chart: the total as a gauge, over the CPUs.
@@ -173,14 +192,20 @@ fn draw_cpu(f: &mut Frame, app: &App, area: Rect, tall: bool) {
     draw_cores(f, &s.cores, cores);
 }
 
-/// The CPU chart's area and the CPUs' own, inside the CPU panel: side by
-/// side, a column apart, where the chart keeps 20 columns, or else the
-/// chart over a few rows of a bar per CPU.
-fn cpu_layout(n: u16, inner: Rect) -> (Rect, Rect) {
+/// The CPU chart's area, a divider's, and the CPUs' own, inside the CPU
+/// panel: side by side where the chart keeps 20 columns, or else the chart
+/// over a few rows of a bar per CPU; the divider is a column or a row
+/// between them, so the chart's line does not run into the bars. Without
+/// CPUs, the chart alone.
+fn cpu_layout(n: u16, inner: Rect) -> (Rect, Option<(Rect, Borders)>, Rect) {
     const CHART: u16 = 20;
+    if n == 0 {
+        return (inner, None, Rect::default());
+    }
     let grid = n.div_ceil(inner.height.max(1)) * CELL;
-    let bars = if n * 2 - 1 + CHART < inner.width {
-        n * 2 - 1
+    let spaced = n * 2 - 1;
+    let bars = if spaced + CHART < inner.width {
+        spaced
     } else {
         n
     };
@@ -189,19 +214,18 @@ fn cpu_layout(n: u16, inner: Rect) -> (Rect, Rect) {
     } else {
         bars
     };
-    if side + 1 + CHART <= inner.width {
-        let [chart, _, cores] = Layout::horizontal([
-            Constraint::Min(CHART),
-            Constraint::Length(1),
+    let (dir, last, border) = if side + 1 + CHART <= inner.width {
+        (
+            Direction::Horizontal,
             Constraint::Length(side),
-        ])
-        .areas(inner);
-        (chart, cores)
+            Borders::LEFT,
+        )
     } else {
-        let [chart, cores] =
-            Layout::vertical([Constraint::Min(0), Constraint::Length(3)]).areas(inner);
-        (chart, cores)
-    }
+        (Direction::Vertical, Constraint::Length(3), Borders::TOP)
+    };
+    let [chart, divider, cores] =
+        Layout::new(dir, [Constraint::Min(0), Constraint::Length(1), last]).areas(inner);
+    (chart, Some((divider, border)), cores)
 }
 
 /// Columns a gauge per CPU takes, labelled.
@@ -611,8 +635,8 @@ fn draw_procs(f: &mut Frame, app: &mut App, area: Rect) {
             Constraint::Length(4),
         ]);
     }
-    header.push(head("COMMAND", None));
-    widths.push(Constraint::Min(10));
+    header.extend([head("NAME", None), head("COMMAND", None)]);
+    widths.extend([Constraint::Length(16), Constraint::Min(10)]);
     let header =
         Row::new(header).style(Style::new().add_modifier(Modifier::BOLD | Modifier::REVERSED));
 
@@ -651,7 +675,10 @@ fn draw_procs(f: &mut Frame, app: &mut App, area: Rect) {
                 ),
             ]);
         }
-        cells.push(Cell::from(p.command.as_str()));
+        cells.extend([
+            Cell::from(p.name.as_str()).bold(),
+            Cell::from(p.command.as_str()).dark_gray(),
+        ]);
         Row::new(cells)
     });
 
@@ -780,17 +807,22 @@ pub fn print_once(app: &App, out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(out, "{}", gpus.info)?;
     for g in &gpus.gpus {
-        writeln!(
-            out,
-            "GPU{} {:<28} util {:>3}%  mem {}/{}  {}  {}",
+        let mut line = format!(
+            "GPU{} {:<28} util {:>3}%  mem {}/{}",
             g.index,
             g.name,
             opt(g.util),
             bytes(g.mem_used),
             bytes(g.mem_total),
-            g.temp.map_or("-".into(), |t| format!("{t}°C")),
-            g.power.map_or("-".into(), |p| format!("{p}W")),
-        )?;
+        );
+        // What the GPU's source gives, alone.
+        if let Some(t) = g.temp {
+            let _ = write!(line, "  {t}°C");
+        }
+        if let Some(p) = g.power {
+            let _ = write!(line, "  {p}W");
+        }
+        writeln!(out, "{line}")?;
     }
     let has_gpus = gpus.per_process();
     writeln!(out)?;
@@ -802,7 +834,7 @@ pub fn print_once(app: &App, out: &mut impl Write) -> io::Result<()> {
     if has_gpus {
         write!(out, " {:>5} {:>8} {:>4}", "GPU", "GPU MEM", "SM%")?;
     }
-    writeln!(out, "  COMMAND")?;
+    writeln!(out, "  {:<16} COMMAND", "NAME")?;
     for i in 0..app.rows.len().min(20) {
         let (p, g) = app.row(i);
         write!(
@@ -822,7 +854,58 @@ pub fn print_once(app: &App, out: &mut impl Write) -> io::Result<()> {
                 opt(g.and_then(|g| g.sm)),
             )?;
         }
-        writeln!(out, "  {}", p.command)?;
+        writeln!(out, "  {:<16.16} {}", p.name, p.command)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cpus_beside_the_chart_where_it_keeps_its_width() {
+        // A 10-CPU Mac's panel at 80 columns.
+        let (chart, divider, cores) = cpu_layout(10, Rect::new(0, 0, 46, 8));
+        let (d, side) = divider.unwrap();
+        assert_eq!(side, Borders::LEFT);
+        assert_eq!((d.width, d.height), (1, 8));
+        assert!(chart.width >= 20);
+        assert_eq!(chart.right(), d.x);
+        assert_eq!(d.right(), cores.x);
+    }
+
+    #[test]
+    fn cpus_under_the_chart_where_they_do_not_fit_beside_it() {
+        let (chart, divider, cores) = cpu_layout(64, Rect::new(0, 0, 56, 8));
+        let (d, side) = divider.unwrap();
+        assert_eq!(side, Borders::TOP);
+        assert_eq!((d.width, d.height), (56, 1));
+        assert_eq!(chart.bottom(), d.y);
+        assert_eq!(d.bottom(), cores.y);
+        assert_eq!(cores.height, 3);
+    }
+
+    #[test]
+    fn intervals_as_people_say_them() {
+        let ms = Duration::from_millis;
+        assert_eq!(interval(ms(250)), "250 ms");
+        assert_eq!(interval(ms(1000)), "1 s");
+        assert_eq!(interval(ms(1500)), "1.5 s");
+        assert_eq!(interval(ms(60000)), "60 s");
+    }
+
+    #[test]
+    fn sizes_under_a_megabyte_in_kilobytes() {
+        assert_eq!(bytes(600 * 1024), "600K");
+        assert_eq!(bytes(5 << 20), "5M");
+        assert_eq!(bytes(3 << 29), "1.5G");
+        assert_eq!(bytes(0), "0K");
+    }
+
+    #[test]
+    fn no_cpus_is_the_chart_alone() {
+        let inner = Rect::new(0, 0, 46, 8);
+        assert_eq!(cpu_layout(0, inner), (inner, None, Rect::default()));
+    }
 }

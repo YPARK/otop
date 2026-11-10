@@ -1,9 +1,11 @@
 //! CPUs, memory and processes, sampled through sysinfo.
 
 use crate::hist::History;
+use crate::ps::Overlay;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::time::{Duration, Instant};
 use sysinfo::{
     CpuRefreshKind, MemoryRefreshKind, Pid, ProcessRefreshKind, ProcessesToUpdate, Signal, System,
     Uid, UpdateKind,
@@ -12,6 +14,9 @@ use sysinfo::{
 /// A process, as last sampled.
 pub struct Proc {
     pub pid: u32,
+    /// The program's name, short where the command is a long path.
+    pub name: String,
+    /// The effective user, as top and ps show.
     pub user: Arc<str>,
     /// Percent of one CPU, so above 100 for a process on several.
     pub cpu: f32,
@@ -21,7 +26,7 @@ pub struct Proc {
     /// When it started, in seconds since the epoch: with its PID, which
     /// can be reused, this says which process it is.
     pub start: u64,
-    /// Its PID, user and command, in lower case, for searching.
+    /// Its PID, user, name and command, in lower case, for searching.
     pub search: String,
 }
 
@@ -81,6 +86,10 @@ impl Users {
 pub struct Sys {
     sys: System,
     users: Users,
+    /// When every process's command and user were last read.
+    reread: Instant,
+    /// What ps says of processes sysinfo cannot read.
+    ps: Overlay,
     pub host: String,
     pub cpu_brand: String,
     /// Each CPU's use, in percent.
@@ -95,13 +104,17 @@ pub struct Sys {
     pub procs: Vec<Proc>,
 }
 
-fn proc_refresh() -> ProcessRefreshKind {
+/// How often every process's command and user are read again, as exec,
+/// setuid and setproctitle change them; between, they are read for new
+/// processes alone, which costs a third as much.
+const REREAD: Duration = Duration::from_secs(5);
+
+fn proc_refresh(names: UpdateKind) -> ProcessRefreshKind {
     ProcessRefreshKind::nothing()
         .with_cpu()
         .with_memory()
-        // Read every time: exec, setuid and setproctitle change them.
-        .with_cmd(UpdateKind::Always)
-        .with_user(UpdateKind::Always)
+        .with_cmd(names)
+        .with_user(names)
         // Processes alone: on Linux each thread would be read too.
         .without_tasks()
 }
@@ -110,7 +123,11 @@ impl Sys {
     pub fn new() -> Self {
         let mut sys = System::new();
         sys.refresh_cpu_specifics(CpuRefreshKind::nothing().with_cpu_usage());
-        sys.refresh_processes_specifics(ProcessesToUpdate::All, true, proc_refresh());
+        sys.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            proc_refresh(UpdateKind::OnlyIfNotSet),
+        );
         let cpu_brand = sys
             .cpus()
             .first()
@@ -119,6 +136,8 @@ impl Sys {
         let mut s = Sys {
             sys,
             users: Users::new(),
+            reread: Instant::now(),
+            ps: Overlay::new(),
             host: System::host_name().unwrap_or_default(),
             cpu_brand,
             cores: Vec::new(),
@@ -142,7 +161,13 @@ impl Sys {
         let sys = &mut self.sys;
         sys.refresh_cpu_specifics(CpuRefreshKind::nothing().with_cpu_usage());
         sys.refresh_memory_specifics(MemoryRefreshKind::everything());
-        sys.refresh_processes_specifics(ProcessesToUpdate::All, true, proc_refresh());
+        let names = if self.reread.elapsed() >= REREAD {
+            self.reread = Instant::now();
+            UpdateKind::Always
+        } else {
+            UpdateKind::OnlyIfNotSet
+        };
+        sys.refresh_processes_specifics(ProcessesToUpdate::All, true, proc_refresh(names));
 
         self.cores = sys.cpus().iter().map(|c| c.cpu_usage()).collect();
         self.cpu = sys.global_cpu_usage();
@@ -156,11 +181,15 @@ impl Sys {
 
         let users = &mut self.users;
         users.receive();
+        self.ps.refresh();
+        let ps = &self.ps;
         self.procs = sys
             .processes()
             .values()
             .filter(|p| p.thread_kind().is_none())
             .map(|p| {
+                let pid = p.pid().as_u32();
+                let name = p.name().to_string_lossy().into_owned();
                 let mut command = String::new();
                 for a in p.cmd() {
                     if !command.is_empty() {
@@ -168,17 +197,29 @@ impl Sys {
                     }
                     command.push_str(&a.to_string_lossy());
                 }
-                if command.is_empty() {
-                    command = format!("[{}]", p.name().to_string_lossy());
-                }
-                let user = p.user_id().map_or_else(|| "?".into(), |u| users.name(u));
-                let pid = p.pid().as_u32();
-                let search = format!("{pid} {user} {command}").to_lowercase();
+                let mut user = p.effective_user_id().or(p.user_id()).map(|u| users.name(u));
+                let mut mem = p.memory();
+                ps.fill(
+                    pid,
+                    &name,
+                    p.start_time(),
+                    &mut user,
+                    &mut mem,
+                    &mut command,
+                );
+                let command = if command.is_empty() {
+                    format!("[{name}]")
+                } else {
+                    command
+                };
+                let user = user.unwrap_or_else(|| "?".into());
+                let search = format!("{pid} {user} {name} {command}").to_lowercase();
                 Proc {
                     pid,
+                    name,
                     user,
                     cpu: p.cpu_usage(),
-                    mem: p.memory(),
+                    mem,
                     command,
                     start: p.start_time(),
                     search,
@@ -190,6 +231,11 @@ impl Sys {
     /// Sends `signal` to process `pid`, if it is still the one started at
     /// `start`; an error says why it was not sent.
     pub fn signal(&mut self, pid: u32, start: u64, signal: Signal) -> Result<(), String> {
+        // kill(0, ...) signals every process in otop's own process group,
+        // not a process 0: macOS lists its kernel as PID 0.
+        if !signalable(pid) {
+            return Err(format!("process {pid} cannot be signalled"));
+        }
         // Look again, now: the process may have ended since the last sample,
         // and its PID been given to another.
         let id = Pid::from_u32(pid);
@@ -209,6 +255,12 @@ impl Sys {
             None => Err(format!("{signal:?} is not supported here")),
         }
     }
+}
+
+/// Whether `pid` names one process to signal: 0, to kill(), is otop's own
+/// process group.
+pub fn signalable(pid: u32) -> bool {
+    pid != 0
 }
 
 /// A UID's name, from the system's user database, which, unlike the
@@ -232,5 +284,16 @@ pub fn frac(used: u64, total: u64) -> f64 {
         0.0
     } else {
         used as f64 / total as f64
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::signalable;
+
+    #[test]
+    fn pid_0_is_never_signalled() {
+        assert!(!signalable(0));
+        assert!(signalable(1));
     }
 }

@@ -14,20 +14,23 @@ pub const PER_PROCESS: bool = false;
 
 #[cfg(target_os = "macos")]
 mod source {
-    use super::{Reading, parse};
+    use super::{Reading, collided, parse};
     use crate::gpu::{Gpu, GpuUse};
     use std::collections::HashMap;
     use std::process::Command;
-    use std::sync::mpsc::{Receiver, channel};
     use std::time::Duration;
 
-    /// How often `ioreg` is run.
-    const EVERY: Duration = Duration::from_millis(500);
+    /// How long to wait before reading again a reading that collided, from
+    /// 30 to 120 ms at random: two programs reading at the same rate in
+    /// step would collide again after a fixed wait.
+    fn again() -> Duration {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos());
+        Duration::from_millis(30 + u64::from(nanos ^ std::process::id()) % 91)
+    }
 
-    /// The GPUs' readings, from `ioreg` run on a thread of its own, since
-    /// running it takes tens of milliseconds.
     pub struct Source {
-        rx: Receiver<Vec<Reading>>,
         last: Vec<Reading>,
     }
 
@@ -37,6 +40,21 @@ mod source {
             .output()
             .map(|o| parse(&String::from_utf8_lossy(&o.stdout)))
             .unwrap_or_default()
+    }
+
+    /// The GPUs' readings, read again a moment later if they look like
+    /// they collided with another program's, given the last ones.
+    fn read_settled(prev: &[Reading]) -> Vec<Reading> {
+        let mut r = ioreg();
+        // Twice at most, then the reading as it is.
+        for _ in 0..2 {
+            if !collided(prev, &r) {
+                break;
+            }
+            std::thread::sleep(again());
+            r = ioreg();
+        }
+        r
     }
 
     impl Source {
@@ -59,19 +77,11 @@ mod source {
                     ..Default::default()
                 })
                 .collect();
-            let (tx, rx) = channel();
-            std::thread::spawn(move || {
-                while tx.send(ioreg()).is_ok() {
-                    std::thread::sleep(EVERY);
-                }
-            });
-            Ok((Source { rx, last }, "Apple GPU".into(), gpus))
+            Ok((Source { last }, "Apple GPU".into(), gpus))
         }
 
         pub fn sample(&mut self, gpus: &mut [Gpu], _: &mut HashMap<u32, GpuUse>) {
-            if let Some(r) = self.rx.try_iter().last() {
-                self.last = r;
-            }
+            self.last = read_settled(&self.last);
             for (g, r) in gpus.iter_mut().zip(&self.last) {
                 g.util = r.util;
                 g.mem_used = r.mem_used.unwrap_or(0);
@@ -87,6 +97,28 @@ pub struct Reading {
     pub util: Option<u32>,
     pub mem_used: Option<u64>,
     pub cores: Option<u32>,
+    /// `TiledSceneBytes`: on Apple's GPUs never 0 but in a collided reading.
+    pub scene: Option<u64>,
+}
+
+/// Whether a reading looks like one that collided with another program's:
+/// when two read the IORegistry at once, macOS can give one of them 0% for
+/// a busy GPU, `TiledSceneBytes` 0 where it is otherwise never 0, or no
+/// statistics at all. Such a reading is taken again, a moment later, when
+/// the other has finished. A GPU that has gone idle reads 0% again, and so
+/// is shown as idle, only 50 ms late.
+pub fn collided(prev: &[Reading], next: &[Reading]) -> bool {
+    next.len() != prev.len()
+        || next.iter().zip(prev).any(|(n, p)| {
+            // Statistics left out, where they were there before: a GPU
+            // whose driver never gives them is not read twice each time.
+            (n.mem_used.is_none() && p.mem_used.is_some())
+                || (n.util == Some(0) && p.util.is_some_and(|u| u > 0))
+                // Even when the last reading was idle, so the GPU's change
+                // from idle to busy is not lost: where `TiledSceneBytes`
+                // has been above 0, a 0 there is a collision.
+                || (n.scene == Some(0) && p.scene.is_some_and(|b| b > 0))
+        })
 }
 
 /// The GPUs in `ioreg -r -d 1 -w 0 -c IOAccelerator`'s output.
@@ -100,6 +132,7 @@ pub fn parse(out: &str) -> Vec<Reading> {
                 util: number_after(entry, "\"Device Utilization %\"").map(|n| n as u32),
                 mem_used: number_after(entry, "\"In use system memory\""),
                 cores: number_after(entry, "\"gpu-core-count\"").map(|n| n as u32),
+                scene: number_after(entry, "\"TiledSceneBytes\""),
             }
         })
         .collect()
@@ -144,6 +177,7 @@ mod tests {
                 util: Some(12),
                 mem_used: Some(611713024),
                 cores: Some(16),
+                scene: None,
             }]
         );
     }
@@ -157,6 +191,67 @@ mod tests {
         assert_eq!(r[0].name, "AMDRadeonX6000");
         assert_eq!(r[0].util, Some(3));
         assert_eq!(r[0].mem_used, None);
+    }
+
+    fn reading(util: u32) -> Reading {
+        Reading {
+            util: Some(util),
+            mem_used: Some(1 << 20),
+            scene: Some(294912),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_collision_after_an_idle_reading_is_read_again() {
+        let mut r = reading(0);
+        r.scene = Some(0);
+        assert!(collided(&[reading(0)], &[r]));
+    }
+
+    #[test]
+    fn a_gpu_whose_scene_bytes_stay_0_is_not_read_again() {
+        let mut r = reading(0);
+        r.scene = Some(0);
+        assert!(!collided(
+            std::slice::from_ref(&r),
+            std::slice::from_ref(&r)
+        ));
+    }
+
+    #[test]
+    fn a_gpu_that_never_gives_scene_bytes_is_not_read_again() {
+        let mut r = reading(0);
+        r.scene = None;
+        assert!(!collided(
+            std::slice::from_ref(&r),
+            std::slice::from_ref(&r)
+        ));
+    }
+
+    #[test]
+    fn a_busy_gpu_dropping_to_zero_is_read_again() {
+        assert!(collided(&[reading(99)], &[reading(0)]));
+    }
+
+    #[test]
+    fn missing_statistics_are_read_again() {
+        let mut r = reading(50);
+        r.mem_used = None;
+        assert!(collided(&[reading(50)], std::slice::from_ref(&r)));
+        assert!(collided(&[reading(50)], &[]));
+        // Never given, so not read again.
+        assert!(!collided(
+            std::slice::from_ref(&r),
+            std::slice::from_ref(&r)
+        ));
+    }
+
+    #[test]
+    fn steady_and_idle_readings_are_kept() {
+        assert!(!collided(&[reading(99)], &[reading(98)]));
+        assert!(!collided(&[reading(0)], &[reading(0)]));
+        assert!(!collided(&[reading(0)], &[reading(40)]));
     }
 
     #[test]
