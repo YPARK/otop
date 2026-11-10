@@ -199,7 +199,14 @@ impl Sys {
                 }
                 let mut user = p.effective_user_id().or(p.user_id()).map(|u| users.name(u));
                 let mut mem = p.memory();
-                ps.fill(pid, p.start_time(), &mut user, &mut mem, &mut command);
+                ps.fill(
+                    pid,
+                    &name,
+                    p.start_time(),
+                    &mut user,
+                    &mut mem,
+                    &mut command,
+                );
                 let command = if command.is_empty() {
                     format!("[{name}]")
                 } else {

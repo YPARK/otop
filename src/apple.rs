@@ -20,8 +20,15 @@ mod source {
     use std::process::Command;
     use std::time::Duration;
 
-    /// How long to wait before reading again a reading that collided.
-    const AGAIN: Duration = Duration::from_millis(50);
+    /// How long to wait before reading again a reading that collided, from
+    /// 30 to 120 ms at random: two programs reading at the same rate in
+    /// step would collide again after a fixed wait.
+    fn again() -> Duration {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos());
+        Duration::from_millis(30 + u64::from(nanos ^ std::process::id()) % 91)
+    }
 
     pub struct Source {
         last: Vec<Reading>,
@@ -38,12 +45,16 @@ mod source {
     /// The GPUs' readings, read again a moment later if they look like
     /// they collided with another program's, given the last ones.
     fn read_settled(prev: &[Reading]) -> Vec<Reading> {
-        let r = ioreg();
-        if !collided(prev, &r) {
-            return r;
+        let mut r = ioreg();
+        // Twice at most, then the reading as it is.
+        for _ in 0..2 {
+            if !collided(prev, &r) {
+                break;
+            }
+            std::thread::sleep(again());
+            r = ioreg();
         }
-        std::thread::sleep(AGAIN);
-        ioreg()
+        r
     }
 
     impl Source {

@@ -247,7 +247,7 @@ impl App {
                     self.mode = Mode::Kill(p.pid, p.start);
                 }
             }
-            KeyCode::Down | KeyCode::Char('j') => self.step(1),
+            KeyCode::Down => self.step(1),
             KeyCode::Up => self.step(-1),
             KeyCode::PageDown => self.step(20),
             KeyCode::PageUp => self.step(-20),

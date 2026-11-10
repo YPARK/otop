@@ -42,17 +42,19 @@ impl Overlay {
         }
     }
 
-    /// Fills in what sysinfo left out of process `pid`, started at `start`,
-    /// from what ps said of it, if ps saw that same process.
+    /// Fills in what sysinfo left out of process `pid`, named `name` and
+    /// started at `start`, from what ps said of it, if ps saw that same
+    /// process.
     pub fn fill(
         &self,
         pid: u32,
+        name: &str,
         start: u64,
         user: &mut Option<Arc<str>>,
         mem: &mut u64,
         command: &mut String,
     ) {
-        let Some(e) = self.ps.get(&pid).filter(|e| e.start.abs_diff(start) <= 2) else {
+        let Some(e) = self.ps.get(&pid).filter(|e| e.is(name, start)) else {
             return;
         };
         if user.is_none() {
@@ -75,7 +77,16 @@ impl Overlay {
 
     pub fn refresh(&mut self) {}
 
-    pub fn fill(&self, _: u32, _: u64, _: &mut Option<Arc<str>>, _: &mut u64, _: &mut String) {}
+    pub fn fill(
+        &self,
+        _: u32,
+        _: &str,
+        _: u64,
+        _: &mut Option<Arc<str>>,
+        _: &mut u64,
+        _: &mut String,
+    ) {
+    }
 }
 
 /// What `ps` says of a process.
@@ -89,6 +100,24 @@ struct PsEntry {
     /// When it started, in seconds since the epoch, to within a second: so
     /// an entry is not taken for a later process given the same PID.
     start: u64,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl PsEntry {
+    /// Whether this is the process named `name` and started at `start`, not
+    /// an earlier one given the same PID. sysinfo gives a start of 0 for
+    /// processes it cannot read, the very ones ps is for: then the name
+    /// must match the start of ps's command, as the program's file name.
+    fn is(&self, name: &str, start: u64) -> bool {
+        if start != 0 {
+            return self.start.abs_diff(start) <= 2;
+        }
+        let program = self.command.split_whitespace().next().unwrap_or("");
+        let program = program.rsplit('/').next().unwrap_or(program);
+        // macOS cuts process names at 16 characters, and a program's
+        // name can have spaces, which ps's command splits.
+        !name.is_empty() && (program.starts_with(name) || name.starts_with(program))
+    }
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -148,7 +177,38 @@ fn elapsed(etime: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{elapsed, parse};
+    use super::{PsEntry, elapsed, parse};
+
+    fn entry(command: &str, start: u64) -> PsEntry {
+        PsEntry {
+            user: "root".into(),
+            rss: 0,
+            command: command.into(),
+            start,
+        }
+    }
+
+    #[test]
+    fn a_known_start_must_match() {
+        let e = entry("/usr/sbin/distnoted agent", 1000);
+        assert!(e.is("distnoted", 1001));
+        assert!(!e.is("distnoted", 1100));
+    }
+
+    #[test]
+    fn an_unknown_start_matches_by_name() {
+        // As sysinfo gives for another user's process on macOS.
+        let e = entry("/usr/sbin/distnoted agent", 1000);
+        assert!(e.is("distnoted", 0));
+        assert!(!e.is("launchd", 0));
+        assert!(!e.is("", 0));
+        // Names cut at 16, or with spaces ps splits.
+        let helper = entry(
+            "/Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/x",
+            1,
+        );
+        assert!(helper.is("Claude Helper (R", 0));
+    }
 
     #[test]
     fn reads_ps() {

@@ -127,9 +127,21 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         format!("  {}  ", s.host).bold(),
         format!("up {}  ", uptime(sysinfo::System::uptime())).into(),
         gpus.into(),
-        format!("every {} ms", app.interval.as_millis()).dark_gray(),
+        format!("every {}", interval(app.interval)).dark_gray(),
     ]);
     f.render_widget(Paragraph::new(line), area);
+}
+
+/// A refresh interval as people say it: 250 ms, 1 s, 1.5 s, 60 s.
+fn interval(d: Duration) -> String {
+    let ms = d.as_millis();
+    if ms < 1000 {
+        format!("{ms} ms")
+    } else if ms.is_multiple_of(1000) {
+        format!("{} s", ms / 1000)
+    } else {
+        format!("{:.1} s", ms as f64 / 1000.0)
+    }
 }
 
 fn uptime(secs: u64) -> String {
@@ -872,6 +884,15 @@ mod tests {
         assert_eq!(chart.bottom(), d.y);
         assert_eq!(d.bottom(), cores.y);
         assert_eq!(cores.height, 3);
+    }
+
+    #[test]
+    fn intervals_as_people_say_them() {
+        let ms = Duration::from_millis;
+        assert_eq!(interval(ms(250)), "250 ms");
+        assert_eq!(interval(ms(1000)), "1 s");
+        assert_eq!(interval(ms(1500)), "1.5 s");
+        assert_eq!(interval(ms(60000)), "60 s");
     }
 
     #[test]

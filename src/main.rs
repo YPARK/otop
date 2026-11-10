@@ -22,7 +22,7 @@ use std::time::Duration;
 ///
 /// Keys: q or Ctrl-C quits.
 ///
-/// Up/Down (or j), PgUp/PgDn, Home/End pick a process.
+/// Up/Down, PgUp/PgDn, Home/End pick a process.
 ///
 /// / searches processes by PID, user, name or command; Enter keeps the
 /// search, Esc clears it.
