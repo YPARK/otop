@@ -14,7 +14,7 @@ pub const PER_PROCESS: bool = false;
 
 #[cfg(target_os = "macos")]
 mod source {
-    use super::{Reading, parse, steady};
+    use super::{Reading, collided, parse};
     use crate::gpu::{Gpu, GpuUse};
     use std::collections::HashMap;
     use std::process::Command;
@@ -23,13 +23,14 @@ mod source {
 
     /// How often `ioreg` is run.
     const EVERY: Duration = Duration::from_millis(500);
+    /// How long to wait before reading again a reading that collided.
+    const AGAIN: Duration = Duration::from_millis(50);
 
     /// The GPUs' readings, from `ioreg` run on a thread of its own, since
     /// running it takes tens of milliseconds.
     pub struct Source {
         rx: Receiver<Vec<Reading>>,
-        /// The last two readings, older first.
-        last: [Vec<Reading>; 2],
+        last: Vec<Reading>,
     }
 
     fn ioreg() -> Vec<Reading> {
@@ -61,21 +62,29 @@ mod source {
                 })
                 .collect();
             let (tx, rx) = channel();
+            let mut prev = last.clone();
             std::thread::spawn(move || {
-                while tx.send(ioreg()).is_ok() {
+                loop {
+                    let mut r = ioreg();
+                    if collided(&prev, &r) {
+                        std::thread::sleep(AGAIN);
+                        r = ioreg();
+                    }
+                    if tx.send(r.clone()).is_err() {
+                        break;
+                    }
+                    prev = r;
                     std::thread::sleep(EVERY);
                 }
             });
-            let last = [Vec::new(), last];
             Ok((Source { rx, last }, "Apple GPU".into(), gpus))
         }
 
         pub fn sample(&mut self, gpus: &mut [Gpu], _: &mut HashMap<u32, GpuUse>) {
-            for r in self.rx.try_iter() {
-                self.last = [std::mem::take(&mut self.last[1]), r];
+            if let Some(r) = self.rx.try_iter().last() {
+                self.last = r;
             }
-            let [older, newer] = &self.last;
-            for (g, r) in gpus.iter_mut().zip(steady(older, newer)) {
+            for (g, r) in gpus.iter_mut().zip(&self.last) {
                 g.util = r.util;
                 g.mem_used = r.mem_used.unwrap_or(0);
             }
@@ -84,7 +93,7 @@ mod source {
 }
 
 /// One GPU's entry in `ioreg`.
-#[derive(Debug, PartialEq, Default)]
+#[derive(Debug, PartialEq, Default, Clone)]
 pub struct Reading {
     pub name: String,
     pub util: Option<u32>,
@@ -92,20 +101,16 @@ pub struct Reading {
     pub cores: Option<u32>,
 }
 
-/// The newer readings, but each GPU's use the higher of the two. When two
-/// programs read the IORegistry at once, macOS gives one of them 0% for a
-/// busy GPU; taking the higher of two readings, half a second apart, hides
-/// that, while an idle GPU, 0% in both, still reads 0.
-pub fn steady(older: &[Reading], newer: &[Reading]) -> Vec<Reading> {
-    newer
-        .iter()
-        .enumerate()
-        .map(|(i, r)| Reading {
-            util: r.util.max(older.get(i).and_then(|o| o.util)),
-            name: r.name.clone(),
-            ..*r
+/// Whether a reading looks like one that collided with another program's:
+/// when two read the IORegistry at once, macOS can give one of them 0% for
+/// a busy GPU, or leave out its statistics. Such a reading is taken again,
+/// a moment later, when the other has finished. A GPU that has gone idle
+/// reads 0% again, and so is shown as idle, only half a second late.
+pub fn collided(prev: &[Reading], next: &[Reading]) -> bool {
+    next.len() != prev.len()
+        || next.iter().zip(prev).any(|(n, p)| {
+            n.mem_used.is_none() || (n.util == Some(0) && p.util.is_some_and(|u| u > 0))
         })
-        .collect()
 }
 
 /// The GPUs in `ioreg -r -d 1 -w 0 -c IOAccelerator`'s output.
@@ -178,24 +183,32 @@ mod tests {
         assert_eq!(r[0].mem_used, None);
     }
 
-    fn util(u: u32) -> Reading {
+    fn reading(util: u32) -> Reading {
         Reading {
-            util: Some(u),
+            util: Some(util),
+            mem_used: Some(1 << 20),
             ..Default::default()
         }
     }
 
     #[test]
-    fn hides_a_stray_zero() {
-        assert_eq!(steady(&[util(99)], &[util(0)])[0].util, Some(99));
-        assert_eq!(steady(&[util(0)], &[util(99)])[0].util, Some(99));
+    fn a_busy_gpu_dropping_to_zero_is_read_again() {
+        assert!(collided(&[reading(99)], &[reading(0)]));
     }
 
     #[test]
-    fn reads_an_idle_gpu_as_idle() {
-        assert_eq!(steady(&[util(0)], &[util(0)])[0].util, Some(0));
-        // At first there is no older reading.
-        assert_eq!(steady(&[], &[util(7)])[0].util, Some(7));
+    fn missing_statistics_are_read_again() {
+        let mut r = reading(50);
+        r.mem_used = None;
+        assert!(collided(&[reading(50)], &[r]));
+        assert!(collided(&[reading(50)], &[]));
+    }
+
+    #[test]
+    fn steady_and_idle_readings_are_kept() {
+        assert!(!collided(&[reading(99)], &[reading(98)]));
+        assert!(!collided(&[reading(0)], &[reading(0)]));
+        assert!(!collided(&[reading(0)], &[reading(40)]));
     }
 
     #[test]

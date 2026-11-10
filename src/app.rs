@@ -320,12 +320,13 @@ impl App {
             .then(a.pid.cmp(&b.pid));
             if self.descending { o.reverse() } else { o }
         });
-        // Keep the process picked where it still is, or else the first.
-        let pid = self.selected.map(|(pid, _)| pid);
+        // Keep the process picked where it still is; where it has ended,
+        // the row it was in, so the selection does not jump to the top.
+        let (pid, was) = self.selected.unzip();
         let i = rows
             .iter()
             .position(|&r| Some(procs[r].pid) == pid)
-            .unwrap_or(0);
+            .unwrap_or_else(|| was.unwrap_or(0).min(rows.len().saturating_sub(1)));
         self.rows = rows;
         self.select(i);
     }
