@@ -8,6 +8,10 @@
 #[cfg(target_os = "macos")]
 pub use source::Source;
 
+/// The IORegistry does not say which processes use the GPU.
+#[cfg(target_os = "macos")]
+pub const PER_PROCESS: bool = false;
+
 #[cfg(target_os = "macos")]
 mod source {
     use super::parse;

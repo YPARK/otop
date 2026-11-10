@@ -40,6 +40,19 @@ impl Gpu {
         crate::sys::frac(self.mem_used, self.mem_total)
     }
 
+    /// Forgets the last sample's readings, keeping what does not change.
+    fn clear(&mut self) {
+        *self = Gpu {
+            index: self.index,
+            name: std::mem::take(&mut self.name),
+            mem_total: self.mem_total,
+            cores: self.cores,
+            hist_util: std::mem::take(&mut self.hist_util),
+            hist_mem: std::mem::take(&mut self.hist_mem),
+            ..Default::default()
+        };
+    }
+
     /// Records this sample in the history.
     pub fn record(&mut self) {
         self.hist_util.push(self.util.unwrap_or(0) as f64);
@@ -64,6 +77,9 @@ pub struct Gpus {
     pub info: String,
     pub gpus: Vec<Gpu>,
     pub procs: HashMap<u32, GpuUse>,
+    /// Whether the source says which processes use the GPUs; Apple's does
+    /// not.
+    pub per_process: bool,
 }
 
 impl Gpus {
@@ -77,6 +93,7 @@ impl Gpus {
             info,
             gpus,
             procs: HashMap::new(),
+            per_process: source::PER_PROCESS,
         };
         g.sample();
         g
@@ -85,6 +102,11 @@ impl Gpus {
     pub fn sample(&mut self) {
         if let Some(s) = &mut self.source {
             self.procs.clear();
+            // What a GPU's read fails to give is shown as unknown, not as
+            // what it was last time.
+            for g in &mut self.gpus {
+                g.clear();
+            }
             s.sample(&mut self.gpus, &mut self.procs);
             for g in &mut self.gpus {
                 g.record();

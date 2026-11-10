@@ -32,10 +32,12 @@ impl SortBy {
         }
     }
 
-    fn next(self) -> Self {
+    /// The next to sort by; GPU memory and SM only where they are known.
+    fn next(self, gpu: bool) -> Self {
         match self {
             SortBy::Cpu => SortBy::Mem,
-            SortBy::Mem => SortBy::GpuMem,
+            SortBy::Mem if gpu => SortBy::GpuMem,
+            SortBy::Mem => SortBy::Pid,
             SortBy::GpuMem => SortBy::Sm,
             SortBy::Sm => SortBy::Pid,
             SortBy::Pid => SortBy::User,
@@ -90,6 +92,7 @@ pub struct Row {
     pub mem: u64,
     pub gpu: Option<GpuUse>,
     pub command: String,
+    pub start: u64,
 }
 
 /// What keys do just now.
@@ -98,8 +101,8 @@ pub enum Mode {
     Normal,
     /// Typing a search, after `/`.
     Search,
-    /// Asked whether to stop this process.
-    Kill(u32),
+    /// Asked whether to stop this process: its PID, and when it started.
+    Kill(u32, u64),
 }
 
 pub struct App {
@@ -149,20 +152,29 @@ impl App {
     }
 
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
-        let mut next = Instant::now() + self.interval;
+        let mut last = Instant::now();
         while !self.quit {
             terminal.draw(|f| ui::draw(f, self))?;
-            let wait = next.saturating_duration_since(Instant::now());
-            if event::poll(wait)?
-                && let Event::Key(k) = event::read()?
-                && k.kind == KeyEventKind::Press
-            {
-                self.key(k);
+            let wait = (last + self.interval).saturating_duration_since(Instant::now());
+            if event::poll(wait)? {
+                // Take every key waiting, as when a search is pasted, and
+                // rebuild the rows once for all of them.
+                loop {
+                    if let Event::Key(k) = event::read()?
+                        && k.kind == KeyEventKind::Press
+                    {
+                        self.key(k);
+                    }
+                    if self.quit || !event::poll(Duration::ZERO)? {
+                        break;
+                    }
+                }
                 self.update_rows();
             }
-            if Instant::now() >= next {
+            // Measured from the last sample, so a new interval applies now.
+            if last.elapsed() >= self.interval {
                 self.sample();
-                next = Instant::now() + self.interval;
+                last = Instant::now();
             }
         }
         Ok(())
@@ -194,14 +206,15 @@ impl App {
                 KeyCode::Char(c) => self.query.push(c),
                 _ => {}
             },
-            Mode::Kill(pid) => {
+            Mode::Kill(pid, start) => {
+                // Only these two; any other key, Enter too, cancels.
                 let signal = match k.code {
-                    KeyCode::Char('t') | KeyCode::Enter => Some(Signal::Term),
-                    KeyCode::Char('9') | KeyCode::Char('K') => Some(Signal::Kill),
+                    KeyCode::Char('t') => Some(Signal::Term),
+                    KeyCode::Char('9') => Some(Signal::Kill),
                     _ => None,
                 };
                 if let Some(s) = signal {
-                    let text = match self.sys.signal(pid, s) {
+                    let text = match self.sys.signal(pid, start, s) {
                         Ok(()) => format!("sent {s:?} to {pid}"),
                         Err(e) => e,
                     };
@@ -220,8 +233,8 @@ impl App {
             KeyCode::Esc => self.quit = true,
             KeyCode::Char('/') => self.mode = Mode::Search,
             KeyCode::Char('k') | KeyCode::F(9) => {
-                if let Some(pid) = self.selected {
-                    self.mode = Mode::Kill(pid);
+                if let Some(r) = self.selected_index().map(|i| &self.rows[i]) {
+                    self.mode = Mode::Kill(r.pid, r.start);
                 }
             }
             KeyCode::Down | KeyCode::Char('j') => self.step(1),
@@ -230,11 +243,11 @@ impl App {
             KeyCode::PageUp => self.step(-20),
             KeyCode::Home => self.step(isize::MIN / 2),
             KeyCode::End => self.step(isize::MAX / 2),
-            KeyCode::Char('s') => self.sort = self.sort.next(),
+            KeyCode::Char('s') => self.sort = self.sort.next(self.gpus.per_process),
             KeyCode::Char('r') => self.descending = !self.descending,
             KeyCode::Char('h') => self.show_charts = !self.show_charts,
             KeyCode::Char('v') => self.charts = self.charts.next(),
-            KeyCode::Char('g') => {
+            KeyCode::Char('g') if self.gpus.per_process => {
                 let n = self.gpus.gpus.len() as u32;
                 self.only = match self.only {
                     Only::All if n > 0 => Only::AnyGpu,
@@ -284,6 +297,7 @@ impl App {
                 mem: p.mem,
                 gpu: gpus.get(&p.pid).cloned(),
                 command: p.command.clone(),
+                start: p.start,
             })
             .filter(|r| match (self.only, &r.gpu) {
                 (Only::All, _) => true,

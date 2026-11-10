@@ -76,7 +76,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // Two columns of GPU panels where there is room for them.
     let cols = if area.width >= 140 && n > 1 { 2 } else { 1 };
     let panels = n.div_ceil(cols) as u16 * PANEL;
-    let top = if app.show_charts { TOP + 2 } else { 4 };
+    // Charts in the top panels where there is height for them as well as
+    // for the processes.
+    let tall = app.show_charts && area.height >= 30;
+    let top = if tall { TOP + 2 } else { 4 };
     let (charts, chart_cols) = chart_layout(app, area, top + panels);
 
     let [header, top_area, gpus, charts_area, procs, footer] = Layout::vertical([
@@ -92,15 +95,15 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_header(f, app, header);
     let [cpu, mem] = Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
         .areas(top_area);
-    draw_cpu(f, app, cpu);
-    draw_mem(f, app, mem);
+    draw_cpu(f, app, cpu, tall);
+    draw_mem(f, app, mem, tall);
     draw_gpus(f, app, gpus, cols);
     if charts > 0 {
         draw_charts(f, app, charts_area, chart_cols);
     }
     draw_procs(f, app, procs);
     draw_footer(f, app, footer);
-    if let Mode::Kill(pid) = app.mode {
+    if let Mode::Kill(pid, _) = app.mode {
         draw_kill(f, app, pid);
     }
 }
@@ -143,7 +146,7 @@ fn gauge<'a>(label: String, ratio: f64) -> LineGauge<'a> {
         .unfilled_style(Style::new().fg(Color::DarkGray))
 }
 
-fn draw_cpu(f: &mut Frame, app: &App, area: Rect) {
+fn draw_cpu(f: &mut Frame, app: &App, area: Rect, tall: bool) {
     let s = &app.sys;
     let block = Block::bordered()
         .border_style(Style::new().fg(Color::Cyan))
@@ -154,7 +157,7 @@ fn draw_cpu(f: &mut Frame, app: &App, area: Rect) {
         .title(Line::from(format!(" {:.0}% ", s.cpu)).right_aligned());
     let inner = block.inner(area);
     f.render_widget(block, area);
-    if !app.show_charts {
+    if !tall {
         let [total, cores] =
             Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
         f.render_widget(
@@ -164,26 +167,44 @@ fn draw_cpu(f: &mut Frame, app: &App, area: Rect) {
         draw_cores(f, &s.cores, cores);
         return;
     }
-    let width = cores_width(s.cores.len() as u16, inner.height, inner.width);
-    let [chart, cores] =
-        Layout::horizontal([Constraint::Min(0), Constraint::Length(width)]).areas(inner);
+    let (chart, cores) = cpu_layout(s.cores.len() as u16, inner);
     draw_history(f, chart, &s.hist_cpu, Color::Cyan);
     draw_cores(f, &s.cores, cores);
 }
 
-/// Columns a gauge per CPU takes, labelled.
-const CELL: u16 = 16;
-
-/// Columns for `n` CPUs' use, `height` rows high, out of `avail`: labelled
-/// gauges where they fit in most of it, or else a bar each.
-fn cores_width(n: u16, height: u16, avail: u16) -> u16 {
-    let grid = n.div_ceil(height.max(1)) * CELL;
-    if grid <= avail * 6 / 10 {
+/// The CPU chart's area and the CPUs' own, inside the CPU panel: side by
+/// side, a column apart, where the chart keeps 20 columns, or else the
+/// chart over a few rows of a bar per CPU.
+fn cpu_layout(n: u16, inner: Rect) -> (Rect, Rect) {
+    const CHART: u16 = 20;
+    let grid = n.div_ceil(inner.height.max(1)) * CELL;
+    let bars = if n * 2 - 1 + CHART < inner.width {
+        n * 2 - 1
+    } else {
+        n
+    };
+    let side = if grid + 1 + CHART <= inner.width {
         grid
     } else {
-        (n * 2).min(avail * 7 / 10).max(n.min(avail))
+        bars
+    };
+    if side + 1 + CHART <= inner.width {
+        let [chart, _, cores] = Layout::horizontal([
+            Constraint::Min(CHART),
+            Constraint::Length(1),
+            Constraint::Length(side),
+        ])
+        .areas(inner);
+        (chart, cores)
+    } else {
+        let [chart, cores] =
+            Layout::vertical([Constraint::Min(0), Constraint::Length(3)]).areas(inner);
+        (chart, cores)
     }
 }
+
+/// Columns a gauge per CPU takes, labelled.
+const CELL: u16 = 16;
 
 /// Each CPU's use: a small labelled gauge each where they fit, or else a
 /// bar each, its height its use.
@@ -212,7 +233,7 @@ fn draw_cores(f: &mut Frame, cores: &[f32], area: Rect) {
         })
         .collect();
     // A gap between bars, where there is room for one.
-    let gap = u16::from(n * 2 - 1 <= area.width);
+    let gap = u16::from(n * 2 <= area.width + 1);
     f.render_widget(
         BarChart::default()
             .data(BarGroup::default().bars(&bars))
@@ -223,7 +244,7 @@ fn draw_cores(f: &mut Frame, cores: &[f32], area: Rect) {
     );
 }
 
-fn draw_mem(f: &mut Frame, app: &App, area: Rect) {
+fn draw_mem(f: &mut Frame, app: &App, area: Rect, tall: bool) {
     let s = &app.sys;
     let block = Block::bordered()
         .border_style(Style::new().fg(Color::Magenta))
@@ -251,7 +272,7 @@ fn draw_mem(f: &mut Frame, app: &App, area: Rect) {
         ),
         swap,
     );
-    if app.show_charts {
+    if tall {
         draw_history(f, chart, &s.hist_mem, Color::Magenta);
     }
 }
@@ -429,7 +450,6 @@ fn draw_charts(f: &mut Frame, app: &App, area: Rect, cols: usize) {
         let title = |t: &str| Line::from(t.to_string());
         draw_chart(
             f,
-            app,
             left,
             title(" GPU utilisation % "),
             Color::DarkGray,
@@ -437,7 +457,6 @@ fn draw_charts(f: &mut Frame, app: &App, area: Rect, cols: usize) {
         );
         draw_chart(
             f,
-            app,
             right,
             title(" GPU memory used % "),
             Color::DarkGray,
@@ -477,24 +496,17 @@ fn draw_charts(f: &mut Frame, app: &App, area: Rect, cols: usize) {
                     "memory ".into(),
                     format!("{}/{} ", bytes(g.mem_used), bytes(g.mem_total)).dark_gray(),
                 ]);
-                draw_chart(f, app, left, util_title, color, vec![util]);
-                draw_chart(f, app, right, mem_title, color, vec![mem]);
+                draw_chart(f, left, util_title, color, vec![util]);
+                draw_chart(f, right, mem_title, color, vec![mem]);
             } else {
                 let title = Line::from(vec![gpu, format!("{} ", g.name).dark_gray()]);
-                draw_chart(f, app, *cell, title, color, vec![util, mem]);
+                draw_chart(f, *cell, title, color, vec![util, mem]);
             }
         }
     }
 }
 
-fn draw_chart(
-    f: &mut Frame,
-    app: &App,
-    area: Rect,
-    title: Line,
-    border: Color,
-    series: Vec<Series>,
-) {
+fn draw_chart(f: &mut Frame, area: Rect, title: Line, border: Color, series: Vec<Series>) {
     // Braille gives two points a cell; show as many samples as fit.
     let width = (area.width.saturating_sub(8) as usize * 2).clamp(10, HISTORY);
     let data: Vec<Vec<(f64, f64)>> = series.iter().map(|(_, _, h)| points(h, width)).collect();
@@ -510,7 +522,9 @@ fn draw_chart(
                 .data(d)
         })
         .collect();
-    let span = (width as f64 * app.interval.as_secs_f64()).round() as u64;
+    let span = series
+        .first()
+        .map_or(0, |(_, _, h)| h.span(width).as_secs());
     let chart = Chart::new(datasets)
         .block(
             Block::bordered()
@@ -536,7 +550,8 @@ fn draw_chart(
 }
 
 fn draw_procs(f: &mut Frame, app: &mut App, area: Rect) {
-    let has_gpus = !app.gpus.gpus.is_empty();
+    // GPU columns where the GPUs' source says which process uses them.
+    let has_gpus = app.gpus.per_process && !app.gpus.gpus.is_empty();
     let arrow = if app.descending { "▼" } else { "▲" };
     let head = |label: &str, by: Option<SortBy>| {
         if by == Some(app.sort) {
@@ -641,27 +656,34 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         f.render_widget(Paragraph::new(format!(" {text}")).yellow(), area);
         return;
     }
-    let key = |k: &'static str| Span::styled(k, Style::new().black().on_cyan());
-    let mut line = vec![
-        key("q"),
-        " quit  ".into(),
-        key("/"),
-        " search  ".into(),
-        key("k"),
-        " kill  ".into(),
-        key("s"),
-        format!(" sort: {}  ", app.sort.label()).into(),
-        key("r"),
-        " reverse  ".into(),
+    // The keys, most wanted first, as many as fit.
+    let gpu = app.gpus.per_process && !app.gpus.gpus.is_empty();
+    let charts = !app.gpus.gpus.is_empty();
+    let mut hints: Vec<(&str, String)> = vec![
+        ("q", "quit".into()),
+        ("/", "search".into()),
+        ("k", "kill".into()),
+        ("s", format!("sort: {}", app.sort.label())),
+        ("h", "charts".into()),
     ];
-    if !app.gpus.gpus.is_empty() {
-        line.extend([key("g"), " GPU filter  ".into()]);
+    if gpu {
+        hints.push(("g", "GPU filter".into()));
     }
-    line.extend([key("h"), " charts  ".into()]);
-    if !app.gpus.gpus.is_empty() {
-        line.extend([key("v"), format!(" {}  ", app.charts.label()).into()]);
+    if charts {
+        hints.push(("v", app.charts.label().into()));
     }
-    line.extend([key("+/-"), " refresh".into()]);
+    hints.extend([("r", "reverse".into()), ("+/-", "refresh".into())]);
+    let mut line = Vec::new();
+    let mut used = 0;
+    for (k, what) in hints {
+        let w = k.chars().count() + what.chars().count() + 3;
+        if used + w > area.width as usize {
+            break;
+        }
+        used += w;
+        line.push(Span::styled(k, Style::new().black().on_cyan()));
+        line.push(format!(" {what}  ").into());
+    }
     f.render_widget(Paragraph::new(Line::from(line)), area);
 }
 

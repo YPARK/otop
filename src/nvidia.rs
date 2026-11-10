@@ -8,11 +8,18 @@ use nvml_wrapper::enum_wrappers::device::{
 use nvml_wrapper::enums::device::UsedGpuMemory;
 use std::collections::HashMap;
 
+/// NVML says which processes use each GPU, and how much.
+pub const PER_PROCESS: bool = true;
+
 pub struct Source {
     nvml: Nvml,
     /// Per GPU, the time of the last process sample read, so each read
     /// returns only what is newer.
     last_seen: Vec<u64>,
+    /// Per GPU, each process's SM use as last read. NVML has no new
+    /// sample when asked faster than it samples, or for an idle process;
+    /// then the last is kept rather than shown as unknown.
+    last_sm: Vec<HashMap<u32, u32>>,
 }
 
 impl Source {
@@ -38,6 +45,7 @@ impl Source {
         let source = Source {
             nvml,
             last_seen: vec![0; n as usize],
+            last_sm: vec![HashMap::new(); n as usize],
         };
         Ok((source, format!("Driver {driver}  CUDA {cuda}"), gpus))
     }
@@ -65,15 +73,20 @@ impl Source {
             g.dec = d.decoder_utilization().ok().map(|e| e.utilization);
             g.pstate = d.performance_state().ok().map(pstate);
 
-            // Each process's SM use since the last read.
-            let mut sm: HashMap<u32, u32> = HashMap::new();
-            if let Ok(samples) = d.process_utilization_stats(self.last_seen[i]) {
+            // Each process's SM use since the last read, if NVML has
+            // sampled since.
+            if let Ok(samples) = d.process_utilization_stats(self.last_seen[i])
+                && !samples.is_empty()
+            {
+                let sm = &mut self.last_sm[i];
+                sm.clear();
                 for s in samples {
                     self.last_seen[i] = self.last_seen[i].max(s.timestamp);
                     let e = sm.entry(s.pid).or_default();
                     *e = (*e).max(s.sm_util);
                 }
             }
+            let sm = &self.last_sm[i];
 
             // A process both computing and drawing is listed twice, with
             // the same memory; count it once on this GPU.
