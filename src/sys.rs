@@ -13,6 +13,9 @@ use sysinfo::{
 /// A process, as last sampled.
 pub struct Proc {
     pub pid: u32,
+    /// The program's name, short where the command is a long path.
+    pub name: String,
+    /// The effective user, as top and ps show.
     pub user: Arc<str>,
     /// Percent of one CPU, so above 100 for a process on several.
     pub cpu: f32,
@@ -22,7 +25,7 @@ pub struct Proc {
     /// When it started, in seconds since the epoch: with its PID, which
     /// can be reused, this says which process it is.
     pub start: u64,
-    /// Its PID, user and command, in lower case, for searching.
+    /// Its PID, user, name and command, in lower case, for searching.
     pub search: String,
 }
 
@@ -84,6 +87,10 @@ pub struct Sys {
     users: Users,
     /// When every process's command and user were last read.
     reread: Instant,
+    /// On macOS, what ps says of processes sysinfo cannot read, those of
+    /// other users: by PID, their user, resident memory and command.
+    #[cfg(target_os = "macos")]
+    ps: HashMap<u32, (Arc<str>, u64, String)>,
     pub host: String,
     pub cpu_brand: String,
     /// Each CPU's use, in percent.
@@ -131,6 +138,8 @@ impl Sys {
             sys,
             users: Users::new(),
             reread: Instant::now(),
+            #[cfg(target_os = "macos")]
+            ps: ps(),
             host: System::host_name().unwrap_or_default(),
             cpu_brand,
             cores: Vec::new(),
@@ -156,6 +165,10 @@ impl Sys {
         sys.refresh_memory_specifics(MemoryRefreshKind::everything());
         let names = if self.reread.elapsed() >= REREAD {
             self.reread = Instant::now();
+            #[cfg(target_os = "macos")]
+            {
+                self.ps = ps();
+            }
             UpdateKind::Always
         } else {
             UpdateKind::OnlyIfNotSet
@@ -174,11 +187,15 @@ impl Sys {
 
         let users = &mut self.users;
         users.receive();
+        #[cfg(target_os = "macos")]
+        let ps = &self.ps;
         self.procs = sys
             .processes()
             .values()
             .filter(|p| p.thread_kind().is_none())
             .map(|p| {
+                let pid = p.pid().as_u32();
+                let name = p.name().to_string_lossy().into_owned();
                 let mut command = String::new();
                 for a in p.cmd() {
                     if !command.is_empty() {
@@ -186,17 +203,26 @@ impl Sys {
                     }
                     command.push_str(&a.to_string_lossy());
                 }
-                if command.is_empty() {
-                    command = format!("[{}]", p.name().to_string_lossy());
-                }
-                let user = p.user_id().map_or_else(|| "?".into(), |u| users.name(u));
-                let pid = p.pid().as_u32();
-                let search = format!("{pid} {user} {command}").to_lowercase();
+                let user = p.effective_user_id().or(p.user_id()).map(|u| users.name(u));
+                // Another user's process, which sysinfo cannot read on
+                // macOS: what ps said of it.
+                #[cfg(target_os = "macos")]
+                let (user, mem, command) = fill(ps.get(&pid), user, p.memory(), command);
+                #[cfg(not(target_os = "macos"))]
+                let mem = p.memory();
+                let command = if command.is_empty() {
+                    format!("[{name}]")
+                } else {
+                    command
+                };
+                let user = user.unwrap_or_else(|| "?".into());
+                let search = format!("{pid} {user} {name} {command}").to_lowercase();
                 Proc {
                     pid,
+                    name,
                     user,
                     cpu: p.cpu_usage(),
-                    mem: p.memory(),
+                    mem,
                     command,
                     start: p.start_time(),
                     search,
@@ -245,10 +271,77 @@ fn user_name(uid: &Uid) -> Arc<str> {
         .into()
 }
 
+/// Every process's user, resident memory and command, as `ps` gives them,
+/// by PID: on macOS ps can read other users' processes, which sysinfo
+/// cannot without root.
+#[cfg(any(target_os = "macos", test))]
+fn parse_ps(out: &str) -> HashMap<u32, (Arc<str>, u64, String)> {
+    out.lines()
+        .filter_map(|l| {
+            let mut f = l.split_whitespace();
+            let pid = f.next()?.parse().ok()?;
+            let rss: u64 = f.next()?.parse().ok()?;
+            let user = f.next()?.into();
+            let args = f.collect::<Vec<_>>().join(" ");
+            Some((pid, (user, rss * 1024, args)))
+        })
+        .collect()
+}
+
+/// What sysinfo could not read of a process, from what ps said of it.
+#[cfg(target_os = "macos")]
+fn fill(
+    ps: Option<&(Arc<str>, u64, String)>,
+    user: Option<Arc<str>>,
+    mem: u64,
+    command: String,
+) -> (Option<Arc<str>>, u64, String) {
+    let Some((u, rss, args)) = ps else {
+        return (user, mem, command);
+    };
+    (
+        user.or_else(|| Some(u.clone())),
+        if mem == 0 { *rss } else { mem },
+        if command.is_empty() {
+            args.clone()
+        } else {
+            command
+        },
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn ps() -> HashMap<u32, (Arc<str>, u64, String)> {
+    std::process::Command::new("ps")
+        .args(["-axo", "pid=,rss=,user=,args="])
+        .output()
+        .map(|o| parse_ps(&String::from_utf8_lossy(&o.stdout)))
+        .unwrap_or_default()
+}
+
 pub fn frac(used: u64, total: u64) -> f64 {
     if total == 0 {
         0.0
     } else {
         used as f64 / total as f64
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_ps;
+
+    #[test]
+    fn reads_ps() {
+        let ps = parse_ps(
+            "  488   1696 root     /usr/sbin/distnoted agent\n 1164   1584 _rmd     /usr/libexec/rmd\nbad line\n",
+        );
+        let (user, rss, args) = &ps[&488];
+        assert_eq!(
+            (&**user, *rss, args.as_str()),
+            ("root", 1696 * 1024, "/usr/sbin/distnoted agent")
+        );
+        assert_eq!(&*ps[&1164].0, "_rmd");
+        assert_eq!(ps.len(), 2);
     }
 }

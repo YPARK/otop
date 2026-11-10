@@ -12,6 +12,11 @@ pub use source::Source;
 #[cfg(target_os = "macos")]
 pub const PER_PROCESS: bool = false;
 
+/// The IORegistry is read every 250 ms at least, so a change in use shows
+/// in a quarter of a second, and a collided reading is soon replaced.
+#[cfg(target_os = "macos")]
+pub const MOST_MS: Option<u64> = Some(250);
+
 #[cfg(target_os = "macos")]
 mod source {
     use super::{Reading, collided, parse};
@@ -86,13 +91,16 @@ pub struct Reading {
     pub util: Option<u32>,
     pub mem_used: Option<u64>,
     pub cores: Option<u32>,
+    /// `TiledSceneBytes`: on Apple's GPUs never 0 but in a collided reading.
+    pub scene: Option<u64>,
 }
 
 /// Whether a reading looks like one that collided with another program's:
 /// when two read the IORegistry at once, macOS can give one of them 0% for
-/// a busy GPU, or leave out its statistics. Such a reading is taken again,
-/// a moment later, when the other has finished. A GPU that has gone idle
-/// reads 0% again, and so is shown as idle, only half a second late.
+/// a busy GPU, `TiledSceneBytes` 0 where it is otherwise never 0, or no
+/// statistics at all. Such a reading is taken again, a moment later, when
+/// the other has finished. A GPU that has gone idle reads 0% again, and so
+/// is shown as idle, only 50 ms late.
 pub fn collided(prev: &[Reading], next: &[Reading]) -> bool {
     next.len() != prev.len()
         || next.iter().zip(prev).any(|(n, p)| {
@@ -100,6 +108,10 @@ pub fn collided(prev: &[Reading], next: &[Reading]) -> bool {
             // whose driver never gives them is not read twice each time.
             (n.mem_used.is_none() && p.mem_used.is_some())
                 || (n.util == Some(0) && p.util.is_some_and(|u| u > 0))
+                // Even when the last reading was idle, so the GPU's change
+                // from idle to busy is not lost: where `TiledSceneBytes`
+                // has been above 0, a 0 there is a collision.
+                || (n.scene == Some(0) && p.scene.is_some_and(|b| b > 0))
         })
 }
 
@@ -114,6 +126,7 @@ pub fn parse(out: &str) -> Vec<Reading> {
                 util: number_after(entry, "\"Device Utilization %\"").map(|n| n as u32),
                 mem_used: number_after(entry, "\"In use system memory\""),
                 cores: number_after(entry, "\"gpu-core-count\"").map(|n| n as u32),
+                scene: number_after(entry, "\"TiledSceneBytes\""),
             }
         })
         .collect()
@@ -158,6 +171,7 @@ mod tests {
                 util: Some(12),
                 mem_used: Some(611713024),
                 cores: Some(16),
+                scene: None,
             }]
         );
     }
@@ -177,8 +191,26 @@ mod tests {
         Reading {
             util: Some(util),
             mem_used: Some(1 << 20),
+            scene: Some(294912),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_collision_after_an_idle_reading_is_read_again() {
+        let mut r = reading(0);
+        r.scene = Some(0);
+        assert!(collided(&[reading(0)], &[r]));
+    }
+
+    #[test]
+    fn a_gpu_that_never_gives_scene_bytes_is_not_read_again() {
+        let mut r = reading(0);
+        r.scene = Some(0);
+        assert!(!collided(
+            std::slice::from_ref(&r),
+            std::slice::from_ref(&r)
+        ));
     }
 
     #[test]

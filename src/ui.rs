@@ -53,8 +53,10 @@ pub fn bytes(b: u64) -> String {
     let b = b as f64;
     if b >= GIB {
         format!("{:.1}G", b / GIB)
-    } else {
+    } else if b >= MIB {
         format!("{:.0}M", b / MIB)
+    } else {
+        format!("{:.0}K", b / 1024.0)
     }
 }
 
@@ -619,8 +621,8 @@ fn draw_procs(f: &mut Frame, app: &mut App, area: Rect) {
             Constraint::Length(4),
         ]);
     }
-    header.push(head("COMMAND", None));
-    widths.push(Constraint::Min(10));
+    header.extend([head("NAME", None), head("COMMAND", None)]);
+    widths.extend([Constraint::Length(16), Constraint::Min(10)]);
     let header =
         Row::new(header).style(Style::new().add_modifier(Modifier::BOLD | Modifier::REVERSED));
 
@@ -659,7 +661,10 @@ fn draw_procs(f: &mut Frame, app: &mut App, area: Rect) {
                 ),
             ]);
         }
-        cells.push(Cell::from(p.command.as_str()));
+        cells.extend([
+            Cell::from(p.name.as_str()).bold(),
+            Cell::from(p.command.as_str()).dark_gray(),
+        ]);
         Row::new(cells)
     });
 
@@ -788,17 +793,22 @@ pub fn print_once(app: &App, out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(out, "{}", gpus.info)?;
     for g in &gpus.gpus {
-        writeln!(
-            out,
-            "GPU{} {:<28} util {:>3}%  mem {}/{}  {}  {}",
+        let mut line = format!(
+            "GPU{} {:<28} util {:>3}%  mem {}/{}",
             g.index,
             g.name,
             opt(g.util),
             bytes(g.mem_used),
             bytes(g.mem_total),
-            g.temp.map_or("-".into(), |t| format!("{t}°C")),
-            g.power.map_or("-".into(), |p| format!("{p}W")),
-        )?;
+        );
+        // What the GPU's source gives, alone.
+        if let Some(t) = g.temp {
+            line += &format!("  {t}°C");
+        }
+        if let Some(p) = g.power {
+            line += &format!("  {p}W");
+        }
+        writeln!(out, "{line}")?;
     }
     let has_gpus = gpus.per_process();
     writeln!(out)?;
@@ -810,7 +820,7 @@ pub fn print_once(app: &App, out: &mut impl Write) -> io::Result<()> {
     if has_gpus {
         write!(out, " {:>5} {:>8} {:>4}", "GPU", "GPU MEM", "SM%")?;
     }
-    writeln!(out, "  COMMAND")?;
+    writeln!(out, "  {:<16} COMMAND", "NAME")?;
     for i in 0..app.rows.len().min(20) {
         let (p, g) = app.row(i);
         write!(
@@ -830,7 +840,7 @@ pub fn print_once(app: &App, out: &mut impl Write) -> io::Result<()> {
                 opt(g.and_then(|g| g.sm)),
             )?;
         }
-        writeln!(out, "  {}", p.command)?;
+        writeln!(out, "  {:<16} {}", p.name, p.command)?;
     }
     Ok(())
 }
@@ -860,6 +870,14 @@ mod tests {
         assert_eq!(chart.bottom(), d.y);
         assert_eq!(d.bottom(), cores.y);
         assert_eq!(cores.height, 3);
+    }
+
+    #[test]
+    fn sizes_under_a_megabyte_in_kilobytes() {
+        assert_eq!(bytes(600 * 1024), "600K");
+        assert_eq!(bytes(5 << 20), "5M");
+        assert_eq!(bytes(3 << 29), "1.5G");
+        assert_eq!(bytes(0), "0K");
     }
 
     #[test]

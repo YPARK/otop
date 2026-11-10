@@ -19,13 +19,26 @@ use std::time::Duration;
 
 /// Monitor CPUs, memory, GPUs and processes, like btop.
 ///
-/// Keys: q quits; up/down, PgUp/PgDn pick a process; / searches processes
-/// by command, user or PID, Enter keeps the search, Esc clears it; k (or
-/// F9) stops the process picked, after asking; s changes what processes are
-/// sorted by, r reverses it; g lists every process, those on a GPU, or on
-/// one GPU; h hides or shows the charts, and v charts each GPU's
-/// utilisation and memory apart, together, or every GPU's in one; +/-
-/// refresh faster or slower.
+/// Keys: q or Ctrl-C quits.
+///
+/// Up/Down (or j), PgUp/PgDn, Home/End pick a process.
+///
+/// / searches processes by PID, user, name or command; Enter keeps the
+/// search, Esc clears it.
+///
+/// k (or F9) stops the process picked, after asking: t terminates, 9
+/// kills, any other key cancels.
+///
+/// s changes what processes are sorted by, r reverses it.
+///
+/// g lists every process, those on a GPU, or those on one GPU (NVIDIA's
+/// GPUs alone, whose driver says which processes use them).
+///
+/// h hides or shows the charts; v charts each GPU's utilisation and memory
+/// apart, together, or every GPU's in one.
+///
+/// Plus and minus refresh faster or slower, in steps: 100 ms, 250 ms,
+/// 500 ms, 1 s, 2 s, 5 s, 10 s, 30 s, 60 s.
 #[derive(Parser)]
 #[command(version)]
 struct Args {
@@ -39,11 +52,8 @@ struct Args {
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let app = app::App::new(
-        sys::Sys::new(),
-        gpu::Gpus::new(),
-        Duration::from_millis(args.interval),
-    );
+    let every = Duration::from_millis(args.interval);
+    let app = app::App::new(sys::Sys::new(), gpu::Gpus::new(every), every);
     if args.once {
         // Piped into `head`, say, stdout may close early; that is not an error.
         return match ui::print_once(&app, &mut std::io::stdout().lock()) {

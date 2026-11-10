@@ -237,8 +237,9 @@ impl App {
     fn normal_key(&mut self, code: KeyCode) {
         match code {
             KeyCode::Char('q') => self.quit = true,
-            KeyCode::Esc if !self.query.is_empty() => self.query.clear(),
-            KeyCode::Esc => self.quit = true,
+            // Clears the search, and does nothing else, so pressing it
+            // once too often to leave a search does not quit.
+            KeyCode::Esc => self.query.clear(),
             KeyCode::Char('/') => self.mode = Mode::Search,
             KeyCode::Char('k') | KeyCode::F(9) => {
                 if let Some(i) = self.selected() {
@@ -265,14 +266,15 @@ impl App {
                     _ => Only::All,
                 };
             }
-            KeyCode::Char('+') | KeyCode::Char('=') => {
-                self.interval = (self.interval / 2).max(Duration::from_millis(100));
-            }
-            KeyCode::Char('-') => {
-                self.interval = (self.interval * 2).min(Duration::from_secs(60));
-            }
+            KeyCode::Char('+') | KeyCode::Char('=') => self.set_interval(faster(self.interval)),
+            KeyCode::Char('-') => self.set_interval(slower(self.interval)),
             _ => {}
         }
+    }
+
+    fn set_interval(&mut self, every: Duration) {
+        self.interval = every;
+        self.gpus.set_interval(every);
     }
 
     /// Picks the row `i`, or none where there are no rows.
@@ -329,5 +331,54 @@ impl App {
             .unwrap_or_else(|| was.unwrap_or(0).min(rows.len().saturating_sub(1)));
         self.rows = rows;
         self.select(i);
+    }
+}
+
+/// The refresh intervals `+` and `-` step through, in milliseconds.
+const STEPS: [u64; 9] = [100, 250, 500, 1000, 2000, 5000, 10000, 30000, 60000];
+
+/// The next step faster than `d`, or the fastest.
+fn faster(d: Duration) -> Duration {
+    let ms = d.as_millis() as u64;
+    let step = STEPS.iter().rev().find(|&&s| s < ms).unwrap_or(&STEPS[0]);
+    Duration::from_millis(*step)
+}
+
+/// The next step slower than `d`, or the slowest.
+fn slower(d: Duration) -> Duration {
+    let ms = d.as_millis() as u64;
+    let step = STEPS
+        .iter()
+        .find(|&&s| s > ms)
+        .unwrap_or(&STEPS[STEPS.len() - 1]);
+    Duration::from_millis(*step)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{faster, slower};
+    use std::time::Duration;
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    #[test]
+    fn steps_come_back_to_a_second() {
+        assert_eq!(faster(slower(ms(1000))), ms(1000));
+        assert_eq!(slower(faster(ms(1000))), ms(1000));
+        assert_eq!(slower(slower(faster(faster(ms(1000))))), ms(1000));
+    }
+
+    #[test]
+    fn steps_stop_at_the_ends() {
+        assert_eq!(faster(ms(100)), ms(100));
+        assert_eq!(slower(ms(60000)), ms(60000));
+    }
+
+    #[test]
+    fn an_interval_between_steps_goes_to_the_next() {
+        assert_eq!(faster(ms(1500)), ms(1000));
+        assert_eq!(slower(ms(1500)), ms(2000));
     }
 }

@@ -5,12 +5,16 @@
 //! `open() -> Result<(Source, String, Vec<Gpu>), String>`, giving the
 //! driver's name for the header and the GPUs, or why there are none, and
 //! `sample(&mut self, &mut [Gpu], &mut HashMap<u32, GpuUse>)`; and with
-//! `PER_PROCESS`, whether it fills in the processes' use. The source is
-//! picked here, once, for the platform.
+//! `PER_PROCESS`, whether it fills in the processes' use, and `MOST_MS`, the
+//! longest it should go between reads, if it has one. The source is picked here, once,
+//! for the platform.
 
 use crate::hist::History;
 use std::collections::HashMap;
-use std::sync::mpsc::{Receiver, SyncSender, channel, sync_channel};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, channel};
+use std::time::Duration;
 
 #[cfg(target_os = "macos")]
 use crate::apple as source;
@@ -105,28 +109,44 @@ fn read(source: &mut source::Source, gpus: &[Gpu]) -> Sample {
     sample
 }
 
-/// The GPUs' source, read on a thread of its own: some reads take tens of
-/// milliseconds (NVML's PCIe throughput, `ioreg`), and the screen should
-/// not wait for them.
+/// The GPUs' source, read on a thread of its own, so the screen does not
+/// wait for reads that take tens of milliseconds (NVML's PCIe throughput,
+/// `ioreg`); the screen takes the newest sample at each refresh.
 struct Reader {
-    /// Asks for a sample; at most one is asked for at a time.
-    ask: SyncSender<()>,
     samples: Receiver<Sample>,
+    /// How often to read, in milliseconds, as the screen's refresh.
+    every: Arc<AtomicU64>,
 }
 
 impl Reader {
-    fn spawn(mut source: source::Source, gpus: Vec<Gpu>) -> Self {
-        let (ask, asked) = sync_channel(1);
+    fn spawn(mut source: source::Source, gpus: Vec<Gpu>, every: Duration) -> Self {
         let (tx, samples) = channel();
+        let every = Arc::new(AtomicU64::new(every.as_millis() as u64));
+        let period = every.clone();
         std::thread::spawn(move || {
-            while asked.recv().is_ok() {
+            let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+            loop {
+                let ms = period.load(Ordering::Relaxed);
+                let ms = source::MOST_MS.map_or(ms, |most| ms.min(most));
+                std::thread::sleep(jittered(ms, &mut seed));
                 if tx.send(read(&mut source, &gpus)).is_err() {
                     break;
                 }
             }
         });
-        Reader { ask, samples }
+        Reader { samples, every }
     }
+}
+
+/// `ms` give or take 15%, so two programs reading the same GPUs at the
+/// same rate drift apart instead of colliding at every read.
+fn jittered(ms: u64, seed: &mut u64) -> Duration {
+    // xorshift: plenty, for spreading reads.
+    *seed ^= *seed << 13;
+    *seed ^= *seed >> 7;
+    *seed ^= *seed << 17;
+    let spread = ms * 3 / 10;
+    Duration::from_millis(ms - spread / 2 + *seed % (spread + 1))
 }
 
 pub struct Gpus {
@@ -138,7 +158,9 @@ pub struct Gpus {
 }
 
 impl Gpus {
-    pub fn new() -> Self {
+    /// The GPUs, read every `every`, or more often where their source
+    /// needs it.
+    pub fn new(every: Duration) -> Self {
         let mut g = Gpus {
             reader: None,
             info: String::new(),
@@ -149,7 +171,7 @@ impl Gpus {
             Ok((mut source, info, gpus)) => {
                 // The first sample at once, so there is one to show.
                 let first = read(&mut source, &gpus);
-                g.reader = Some(Reader::spawn(source, gpus.clone()));
+                g.reader = Some(Reader::spawn(source, gpus.clone(), every));
                 g.info = info;
                 g.gpus = gpus;
                 g.take(first);
@@ -173,16 +195,35 @@ impl Gpus {
         self.procs = procs;
     }
 
-    /// Takes the newest sample the reader has, if any, and asks for the
-    /// next.
+    /// Reads the GPUs every `every` from now on.
+    pub fn set_interval(&self, every: Duration) {
+        if let Some(r) = &self.reader {
+            r.every.store(every.as_millis() as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// Takes the newest sample the reader has.
     pub fn sample(&mut self) {
         let Some(r) = &self.reader else { return };
-        let newest = r.samples.try_iter().last();
-        let _ = r.ask.try_send(());
-        match newest {
+        match r.samples.try_iter().last() {
             Some(s) => self.take(s),
             // None yet: the last readings again, so the charts keep time.
             None => self.gpus.iter_mut().for_each(Gpu::record),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::jittered;
+    use std::time::Duration;
+
+    #[test]
+    fn jitter_stays_within_15_percent() {
+        let mut seed = 1;
+        for _ in 0..1000 {
+            let d = jittered(1000, &mut seed);
+            assert!(d >= Duration::from_millis(850) && d <= Duration::from_millis(1150));
         }
     }
 }
