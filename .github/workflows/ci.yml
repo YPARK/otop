@@ -17,7 +17,11 @@ env:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -27,6 +31,8 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
+      # Runs without a GPU on the runners: it must still sample and print.
+      - run: cargo run --locked -- --once
 
   # The oldest Rust the crate says it builds with, read from Cargo.toml.
   msrv:

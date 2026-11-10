@@ -1,39 +1,45 @@
 //! The app's state, and the keys that change it.
 
-use crate::gpu::{Proc, Sampler};
+use crate::gpu::{GpuUse, Gpus};
+use crate::sys::{Proc, Sys};
 use crate::ui;
 use ratatui::DefaultTerminal;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use ratatui::widgets::TableState;
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::time::{Duration, Instant};
+use sysinfo::Signal;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SortBy {
+    Cpu,
     Mem,
+    GpuMem,
     Sm,
     Pid,
-    Gpu,
     User,
 }
 
 impl SortBy {
     pub fn label(self) -> &'static str {
         match self {
+            SortBy::Cpu => "CPU",
             SortBy::Mem => "memory",
+            SortBy::GpuMem => "GPU memory",
             SortBy::Sm => "SM",
             SortBy::Pid => "PID",
-            SortBy::Gpu => "GPU",
             SortBy::User => "user",
         }
     }
 
-    fn next(self) -> Self {
+    /// The next to sort by; GPU memory and SM only where they are known.
+    fn next(self, gpu: bool) -> Self {
         match self {
-            SortBy::Mem => SortBy::Sm,
+            SortBy::Cpu => SortBy::Mem,
+            SortBy::Mem if gpu => SortBy::GpuMem,
+            SortBy::Mem => SortBy::Pid,
+            SortBy::GpuMem => SortBy::Sm,
             SortBy::Sm => SortBy::Pid,
-            SortBy::Pid => SortBy::Gpu,
-            SortBy::Gpu => SortBy::User,
-            SortBy::User => SortBy::Mem,
+            SortBy::Pid => SortBy::User,
+            SortBy::User => SortBy::Cpu,
         }
     }
 }
@@ -67,75 +73,197 @@ impl Charts {
     }
 }
 
+/// Which processes are listed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Only {
+    All,
+    AnyGpu,
+    Gpu(u32),
+}
+
+/// What keys do just now.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Normal,
+    /// Typing a search, after `/`.
+    Search,
+    /// Asked whether to stop this process: its PID, and when it started.
+    Kill(u32, u64),
+}
+
 pub struct App {
-    pub sampler: Sampler,
+    pub sys: Sys,
+    pub gpus: Gpus,
     pub interval: Duration,
     pub sort: SortBy,
     /// Largest first, unless reversed.
     pub descending: bool,
-    /// Processes of this GPU alone, or of all.
-    pub only_gpu: Option<u32>,
+    pub only: Only,
     pub show_charts: bool,
     pub charts: Charts,
-    pub table: TableState,
+    pub mode: Mode,
+    /// Processes whose PID, user or command contain this are listed.
+    pub query: String,
+    /// The processes listed, as indices into `sys.procs`, filtered and
+    /// sorted as of the last sample.
+    pub rows: Vec<usize>,
+    /// The process picked, kept by PID as rows are sorted around it, and
+    /// its place in `rows`.
+    selected: Option<(u32, usize)>,
+    /// The first row on screen.
+    pub offset: usize,
+    /// What the last kill did, shown for a few seconds.
+    pub message: Option<(String, Instant)>,
     quit: bool,
 }
 
 impl App {
-    pub fn new(sampler: Sampler, interval: Duration) -> Self {
-        App {
-            sampler,
+    pub fn new(sys: Sys, gpus: Gpus, interval: Duration) -> Self {
+        let mut app = App {
+            sys,
+            gpus,
             interval,
-            sort: SortBy::Mem,
+            sort: SortBy::Cpu,
             descending: true,
-            only_gpu: None,
+            only: Only::All,
             show_charts: true,
             charts: Charts::Split,
-            table: TableState::default().with_selected(Some(0)),
+            mode: Mode::Normal,
+            query: String::new(),
+            rows: Vec::new(),
+            selected: None,
+            offset: 0,
+            message: None,
             quit: false,
-        }
+        };
+        app.update_rows();
+        app
+    }
+
+    /// The process listed in `row`, and its use of the GPUs.
+    pub fn row(&self, row: usize) -> (&Proc, Option<&GpuUse>) {
+        let p = &self.sys.procs[self.rows[row]];
+        (p, self.gpus.procs.get(&p.pid))
+    }
+
+    /// The row picked.
+    pub fn selected(&self) -> Option<usize> {
+        self.selected.map(|(_, i)| i)
     }
 
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
-        let mut next = Instant::now() + self.interval;
+        let mut last = Instant::now();
         while !self.quit {
             terminal.draw(|f| ui::draw(f, self))?;
-            let wait = next.saturating_duration_since(Instant::now());
-            if event::poll(wait)?
-                && let Event::Key(k) = event::read()?
-                && k.kind == KeyEventKind::Press
-            {
-                self.key(k.code, k.modifiers);
+            let wait = (last + self.interval).saturating_duration_since(Instant::now());
+            if event::poll(wait)? {
+                // Take every key waiting, as when a search is pasted, and
+                // rebuild the rows once, if they changed what is listed.
+                let before = self.listing();
+                loop {
+                    if let Event::Key(k) = event::read()?
+                        && k.kind == KeyEventKind::Press
+                    {
+                        self.key(k);
+                    }
+                    if self.quit || !event::poll(Duration::ZERO)? {
+                        break;
+                    }
+                }
+                if self.listing() != before {
+                    self.update_rows();
+                }
             }
-            if Instant::now() >= next {
-                self.sampler.sample();
-                next = Instant::now() + self.interval;
+            // Measured from the last sample, so a new interval applies now.
+            if last.elapsed() >= self.interval {
+                self.sample();
+                last = Instant::now();
             }
         }
         Ok(())
     }
 
-    fn key(&mut self, code: KeyCode, mods: KeyModifiers) {
-        let n = self.processes().len();
+    /// What decides which processes are listed, and in what order.
+    fn listing(&self) -> (String, SortBy, bool, Only) {
+        (self.query.clone(), self.sort, self.descending, self.only)
+    }
+
+    fn sample(&mut self) {
+        self.sys.sample();
+        self.gpus.sample();
+        self.update_rows();
+    }
+
+    fn key(&mut self, k: KeyEvent) {
+        if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
+            self.quit = true;
+            return;
+        }
+        match self.mode {
+            Mode::Search => match k.code {
+                KeyCode::Enter => self.mode = Mode::Normal,
+                KeyCode::Esc => {
+                    self.query.clear();
+                    self.mode = Mode::Normal;
+                }
+                KeyCode::Backspace => {
+                    self.query.pop();
+                }
+                KeyCode::Up => self.step(-1),
+                KeyCode::Down => self.step(1),
+                KeyCode::Char(c) => self.query.push(c),
+                _ => {}
+            },
+            Mode::Kill(pid, start) => {
+                // Only these two; any other key, Enter too, cancels.
+                let signal = match k.code {
+                    KeyCode::Char('t') => Some(Signal::Term),
+                    KeyCode::Char('9') => Some(Signal::Kill),
+                    _ => None,
+                };
+                if let Some(s) = signal {
+                    let text = match self.sys.signal(pid, start, s) {
+                        Ok(()) => format!("sent {s:?} to {pid}"),
+                        Err(e) => e,
+                    };
+                    self.message = Some((text, Instant::now()));
+                }
+                self.mode = Mode::Normal;
+            }
+            Mode::Normal => self.normal_key(k.code),
+        }
+    }
+
+    fn normal_key(&mut self, code: KeyCode) {
         match code {
-            KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
-            KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => self.quit = true,
-            KeyCode::Down | KeyCode::Char('j') => self.table.select_next(),
-            KeyCode::Up | KeyCode::Char('k') => self.table.select_previous(),
-            KeyCode::Home => self.table.select_first(),
-            KeyCode::End => self.table.select(Some(n.saturating_sub(1))),
-            KeyCode::Char('s') => self.sort = self.sort.next(),
+            KeyCode::Char('q') => self.quit = true,
+            KeyCode::Esc if !self.query.is_empty() => self.query.clear(),
+            KeyCode::Esc => self.quit = true,
+            KeyCode::Char('/') => self.mode = Mode::Search,
+            KeyCode::Char('k') | KeyCode::F(9) => {
+                if let Some(i) = self.selected() {
+                    let p = self.row(i).0;
+                    self.mode = Mode::Kill(p.pid, p.start);
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => self.step(1),
+            KeyCode::Up => self.step(-1),
+            KeyCode::PageDown => self.step(20),
+            KeyCode::PageUp => self.step(-20),
+            KeyCode::Home => self.step(isize::MIN / 2),
+            KeyCode::End => self.step(isize::MAX / 2),
+            KeyCode::Char('s') => self.sort = self.sort.next(self.gpus.per_process()),
             KeyCode::Char('r') => self.descending = !self.descending,
             KeyCode::Char('h') => self.show_charts = !self.show_charts,
             KeyCode::Char('v') => self.charts = self.charts.next(),
-            KeyCode::Char('g') => {
-                let count = self.sampler.gpus.len() as u32;
-                self.only_gpu = match self.only_gpu {
-                    None if count > 0 => Some(0),
-                    Some(i) if i + 1 < count => Some(i + 1),
-                    _ => None,
+            KeyCode::Char('g') if self.gpus.per_process() => {
+                let n = self.gpus.gpus.len() as u32;
+                self.only = match self.only {
+                    Only::All => Only::AnyGpu,
+                    Only::AnyGpu if n > 1 => Only::Gpu(0),
+                    Only::Gpu(i) if i + 1 < n => Only::Gpu(i + 1),
+                    _ => Only::All,
                 };
-                self.table.select(Some(0));
             }
             KeyCode::Char('+') | KeyCode::Char('=') => {
                 self.interval = (self.interval / 2).max(Duration::from_millis(100));
@@ -147,62 +275,58 @@ impl App {
         }
     }
 
-    /// The processes shown, filtered and sorted.
-    pub fn processes(&self) -> Vec<Proc> {
-        let mut ps: Vec<Proc> = self
-            .sampler
-            .procs
-            .iter()
-            .filter(|p| self.only_gpu.is_none_or(|g| p.gpu == g))
-            .cloned()
+    /// Picks the row `i`, or none where there are no rows.
+    fn select(&mut self, i: usize) {
+        self.selected = self.rows.get(i).map(|&p| (self.sys.procs[p].pid, i));
+    }
+
+    /// Moves the selection `by` rows, staying within the list.
+    fn step(&mut self, by: isize) {
+        let last = self.rows.len().saturating_sub(1);
+        let i = self
+            .selected()
+            .map_or(0, |i| i.saturating_add_signed(by).min(last));
+        self.select(i);
+    }
+
+    /// Rebuilds the rows, from the last sample, as filtered and sorted now.
+    fn update_rows(&mut self) {
+        let query = self.query.to_lowercase();
+        let (procs, gpus) = (&self.sys.procs, &self.gpus.procs);
+        let gpu = |p: &Proc| gpus.get(&p.pid);
+        let mut rows: Vec<usize> = (0..procs.len())
+            .filter(|&i| {
+                let p = &procs[i];
+                let on = match (self.only, gpu(p)) {
+                    (Only::All, _) => true,
+                    (Only::AnyGpu, g) => g.is_some(),
+                    (Only::Gpu(i), g) => g.is_some_and(|g| g.gpus.contains(&i)),
+                };
+                on && p.search.contains(&query)
+            })
             .collect();
-        ps.sort_by(|a, b| {
+        let gmem = |p: &Proc| gpu(p).and_then(|g| g.mem);
+        let sm = |p: &Proc| gpu(p).and_then(|g| g.sm);
+        rows.sort_by(|&a, &b| {
+            let (a, b) = (&procs[a], &procs[b]);
             let o = match self.sort {
+                SortBy::Cpu => a.cpu.total_cmp(&b.cpu),
                 SortBy::Mem => a.mem.cmp(&b.mem),
-                SortBy::Sm => a.sm.cmp(&b.sm),
+                SortBy::GpuMem => gmem(a).cmp(&gmem(b)),
+                SortBy::Sm => sm(a).cmp(&sm(b)),
                 SortBy::Pid => a.pid.cmp(&b.pid),
-                SortBy::Gpu => a.gpu.cmp(&b.gpu),
                 SortBy::User => a.user.cmp(&b.user),
             }
             .then(a.pid.cmp(&b.pid));
             if self.descending { o.reverse() } else { o }
         });
-        ps
-    }
-}
-
-/// `--once`: the GPUs and their processes, printed as plain text.
-pub fn print_once(s: &Sampler) {
-    println!("Driver {}  CUDA {}", s.driver, s.cuda);
-    for g in &s.gpus {
-        println!(
-            "GPU{} {:<28} util {:>3}%  mem {}/{}  {}  {}",
-            g.index,
-            g.name,
-            ui::opt(g.util),
-            ui::bytes(g.mem_used),
-            ui::bytes(g.mem_total),
-            g.temp.map_or("-".into(), |t| format!("{t}°C")),
-            g.power.map_or("-".into(), |p| format!("{}W", p / 1000)),
-        );
-    }
-    if !s.procs.is_empty() {
-        println!();
-        println!(
-            "{:>8} {:>3} {:>3} {:<10} {:>9} {:>4}  COMMAND",
-            "PID", "GPU", "TYP", "USER", "MEM", "SM%"
-        );
-        for p in &s.procs {
-            println!(
-                "{:>8} {:>3} {:>3} {:<10} {:>9} {:>4}  {}",
-                p.pid,
-                p.gpu,
-                p.kind.label(),
-                p.user,
-                p.mem.map_or("-".into(), ui::bytes),
-                ui::opt(p.sm),
-                p.command
-            );
-        }
+        // Keep the process picked where it still is, or else the first.
+        let pid = self.selected.map(|(pid, _)| pid);
+        let i = rows
+            .iter()
+            .position(|&r| Some(procs[r].pid) == pid)
+            .unwrap_or(0);
+        self.rows = rows;
+        self.select(i);
     }
 }

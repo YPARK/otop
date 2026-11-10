@@ -1,286 +1,136 @@
-//! GPUs and their processes, sampled through NVML.
+//! GPUs, from whichever source this platform has: NVIDIA's NVML, or on
+//! macOS the IORegistry, for Apple's GPUs. Without one, there are none.
+//!
+//! Each source is a module with a `Source` that has
+//! `open() -> Result<(Source, String, Vec<Gpu>), String>`, giving the
+//! driver's name for the header and the GPUs, or why there are none, and
+//! `sample(&mut self, &mut [Gpu], &mut HashMap<u32, GpuUse>)`; and with
+//! `PER_PROCESS`, whether it fills in the processes' use. The source is
+//! picked here, once, for the platform.
 
-use nvml_wrapper::Nvml;
-use nvml_wrapper::enum_wrappers::device::{
-    Clock, PcieUtilCounter, PerformanceState, TemperatureSensor,
-};
-use nvml_wrapper::enums::device::UsedGpuMemory;
-use std::collections::{HashMap, VecDeque};
+use crate::hist::History;
+use std::collections::HashMap;
 
-/// How many samples of history each GPU keeps.
-pub const HISTORY: usize = 600;
+#[cfg(target_os = "macos")]
+use crate::apple as source;
+#[cfg(not(target_os = "macos"))]
+use crate::nvidia as source;
 
-/// One GPU, as last sampled. Anything the driver does not report is `None`.
+/// One GPU, as last sampled, in plain units. Anything its source does not
+/// report is `None`.
 #[derive(Default, Clone)]
 pub struct Gpu {
     pub index: u32,
     pub name: String,
+    /// Percent.
     pub util: Option<u32>,
-    pub mem_util: Option<u32>,
+    /// Bytes.
     pub mem_used: u64,
     pub mem_total: u64,
+    /// Degrees Celsius.
     pub temp: Option<u32>,
+    /// Watts.
     pub power: Option<u32>,
     pub power_limit: Option<u32>,
+    /// Percent.
     pub fan: Option<u32>,
+    /// MHz.
     pub clock_gr: Option<u32>,
     pub clock_gr_max: Option<u32>,
     pub clock_mem: Option<u32>,
-    pub pcie_tx: Option<u32>,
-    pub pcie_rx: Option<u32>,
+    /// PCIe throughput, in bytes per second.
+    pub pcie_tx: Option<u64>,
+    pub pcie_rx: Option<u64>,
+    /// Encoder and decoder use, in percent.
     pub enc: Option<u32>,
     pub dec: Option<u32>,
     pub pstate: Option<String>,
-    /// GPU utilisation, and memory used, in percent, oldest first.
-    pub hist_util: VecDeque<f64>,
-    pub hist_mem: VecDeque<f64>,
+    /// Apple's GPUs: how many cores.
+    pub cores: Option<u32>,
+    pub hist_util: History,
+    pub hist_mem: History,
 }
 
 impl Gpu {
     pub fn mem_frac(&self) -> f64 {
-        if self.mem_total == 0 {
-            0.0
-        } else {
-            self.mem_used as f64 / self.mem_total as f64
-        }
+        crate::sys::frac(self.mem_used, self.mem_total)
     }
-}
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Kind {
-    Compute,
-    Graphics,
-    Both,
-}
-
-impl Kind {
-    pub fn label(self) -> &'static str {
-        match self {
-            Kind::Compute => "C",
-            Kind::Graphics => "G",
-            Kind::Both => "C+G",
-        }
-    }
-}
-
-/// A process with memory on a GPU.
-#[derive(Clone)]
-pub struct Proc {
-    pub pid: u32,
-    pub gpu: u32,
-    pub kind: Kind,
-    pub user: String,
-    pub mem: Option<u64>,
-    pub sm: Option<u32>,
-    pub enc: Option<u32>,
-    pub dec: Option<u32>,
-    pub command: String,
-}
-
-pub struct Sampler {
-    nvml: Nvml,
-    pub driver: String,
-    pub cuda: String,
-    pub gpus: Vec<Gpu>,
-    pub procs: Vec<Proc>,
-    /// Per GPU, the time of the last process sample read, so each read
-    /// returns only what is newer.
-    last_seen: Vec<u64>,
-    users: HashMap<u32, String>,
-}
-
-impl Sampler {
-    pub fn new() -> anyhow::Result<Self> {
-        let nvml = Nvml::init().map_err(|e| {
-            anyhow::anyhow!("cannot load NVML ({e}); is NVIDIA's driver installed?")
-        })?;
-        let driver = nvml.sys_driver_version().unwrap_or_else(|_| "?".into());
-        let cuda = nvml
-            .sys_cuda_driver_version()
-            .map(|v| format!("{}.{}", v / 1000, (v % 1000) / 10))
-            .unwrap_or_else(|_| "?".into());
-        let n = nvml.device_count()?;
-        let mut gpus = Vec::with_capacity(n as usize);
-        for i in 0..n {
-            let name = nvml
-                .device_by_index(i)
-                .and_then(|d| d.name())
-                .unwrap_or_else(|_| "unknown".into());
-            gpus.push(Gpu {
-                index: i,
-                name,
-                ..Default::default()
-            });
-        }
-        let mut s = Sampler {
-            nvml,
-            driver,
-            cuda,
-            gpus,
-            procs: Vec::new(),
-            last_seen: vec![0; n as usize],
-            users: read_passwd(),
+    /// Forgets the last sample's readings, keeping what does not change.
+    fn clear(&mut self) {
+        *self = Gpu {
+            index: self.index,
+            name: std::mem::take(&mut self.name),
+            mem_total: self.mem_total,
+            power_limit: self.power_limit,
+            clock_gr_max: self.clock_gr_max,
+            cores: self.cores,
+            hist_util: std::mem::take(&mut self.hist_util),
+            hist_mem: std::mem::take(&mut self.hist_mem),
+            ..Default::default()
         };
-        s.sample();
-        Ok(s)
     }
 
-    /// Reads every GPU, and the processes on them, once.
+    /// Records this sample in the history.
+    fn record(&mut self) {
+        self.hist_util.push(self.util.unwrap_or(0) as f64);
+        self.hist_mem.push(100.0 * self.mem_frac());
+    }
+}
+
+/// A process's use of the GPUs.
+#[derive(Default, Clone)]
+pub struct GpuUse {
+    /// The GPUs it is on, in order.
+    pub gpus: Vec<u32>,
+    /// GPU memory, summed over them, where the driver reports it.
+    pub mem: Option<u64>,
+    /// SM use, the most on any of them.
+    pub sm: Option<u32>,
+}
+
+pub struct Gpus {
+    source: Option<source::Source>,
+    /// The driver, or why there are no GPUs, for the header.
+    pub info: String,
+    pub gpus: Vec<Gpu>,
+    pub procs: HashMap<u32, GpuUse>,
+}
+
+impl Gpus {
+    pub fn new() -> Self {
+        let (source, info, gpus) = match source::Source::open() {
+            Ok((s, info, gpus)) => (Some(s), info, gpus),
+            Err(why) => (None, why, Vec::new()),
+        };
+        let mut g = Gpus {
+            source,
+            info,
+            gpus,
+            procs: HashMap::new(),
+        };
+        g.sample();
+        g
+    }
+
+    /// Whether there are GPUs, and their source says which processes use
+    /// them: Apple's does not.
+    pub fn per_process(&self) -> bool {
+        source::PER_PROCESS && !self.gpus.is_empty()
+    }
+
     pub fn sample(&mut self) {
-        let mut procs: Vec<Proc> = Vec::new();
-        for (i, g) in self.gpus.iter_mut().enumerate() {
-            let Ok(d) = self.nvml.device_by_index(i as u32) else {
-                continue;
-            };
-            let u = d.utilization_rates().ok();
-            g.util = u.as_ref().map(|u| u.gpu);
-            g.mem_util = u.as_ref().map(|u| u.memory);
-            if let Ok(m) = d.memory_info() {
-                g.mem_used = m.used;
-                g.mem_total = m.total;
+        if let Some(s) = &mut self.source {
+            self.procs.clear();
+            // What a GPU's read fails to give is shown as unknown, not as
+            // what it was last time.
+            for g in &mut self.gpus {
+                g.clear();
             }
-            g.temp = d.temperature(TemperatureSensor::Gpu).ok();
-            g.power = d.power_usage().ok();
-            g.power_limit = d.enforced_power_limit().ok();
-            g.fan = d.fan_speed(0).ok();
-            g.clock_gr = d.clock_info(Clock::Graphics).ok();
-            g.clock_gr_max = d.max_clock_info(Clock::Graphics).ok();
-            g.clock_mem = d.clock_info(Clock::Memory).ok();
-            g.pcie_tx = d.pcie_throughput(PcieUtilCounter::Send).ok();
-            g.pcie_rx = d.pcie_throughput(PcieUtilCounter::Receive).ok();
-            g.enc = d.encoder_utilization().ok().map(|e| e.utilization);
-            g.dec = d.decoder_utilization().ok().map(|e| e.utilization);
-            g.pstate = d.performance_state().ok().map(pstate);
-
-            push(&mut g.hist_util, g.util.unwrap_or(0) as f64);
-            let mem = 100.0 * g.mem_frac();
-            push(&mut g.hist_mem, mem);
-
-            // Per-process SM, encoder and decoder use since the last read.
-            let mut util: HashMap<u32, (u32, u32, u32)> = HashMap::new();
-            if let Ok(samples) = d.process_utilization_stats(self.last_seen[i]) {
-                for s in samples {
-                    self.last_seen[i] = self.last_seen[i].max(s.timestamp);
-                    let e = util.entry(s.pid).or_default();
-                    e.0 = e.0.max(s.sm_util);
-                    e.1 = e.1.max(s.enc_util);
-                    e.2 = e.2.max(s.dec_util);
-                }
+            s.sample(&mut self.gpus, &mut self.procs);
+            for g in &mut self.gpus {
+                g.record();
             }
-
-            let mut on_gpu: Vec<Proc> = Vec::new();
-            let lists = [
-                (Kind::Compute, d.running_compute_processes()),
-                (Kind::Graphics, d.running_graphics_processes()),
-            ];
-            for (kind, list) in lists {
-                for p in list.unwrap_or_default() {
-                    let mem = match p.used_gpu_memory {
-                        UsedGpuMemory::Used(b) => Some(b),
-                        UsedGpuMemory::Unavailable => None,
-                    };
-                    if let Some(q) = on_gpu.iter_mut().find(|q| q.pid == p.pid) {
-                        if q.kind != kind {
-                            q.kind = Kind::Both;
-                        }
-                        continue;
-                    }
-                    let u = util.get(&p.pid);
-                    on_gpu.push(Proc {
-                        pid: p.pid,
-                        gpu: i as u32,
-                        kind,
-                        user: String::new(),
-                        mem,
-                        sm: u.map(|u| u.0),
-                        enc: u.map(|u| u.1),
-                        dec: u.map(|u| u.2),
-                        command: String::new(),
-                    });
-                }
-            }
-            procs.extend(on_gpu);
         }
-        for p in &mut procs {
-            p.user = proc_user(p.pid, &self.users);
-            p.command = proc_command(p.pid);
-        }
-        self.procs = procs;
-    }
-}
-
-/// A performance state as nvidia-smi writes it: P0 is fastest, P8 idle.
-fn pstate(p: PerformanceState) -> String {
-    use PerformanceState::*;
-    let n = match p {
-        Zero => 0,
-        One => 1,
-        Two => 2,
-        Three => 3,
-        Four => 4,
-        Five => 5,
-        Six => 6,
-        Seven => 7,
-        Eight => 8,
-        Nine => 9,
-        Ten => 10,
-        Eleven => 11,
-        Twelve => 12,
-        Thirteen => 13,
-        Fourteen => 14,
-        Fifteen => 15,
-        Unknown => return "P?".into(),
-    };
-    format!("P{n}")
-}
-
-fn push(h: &mut VecDeque<f64>, v: f64) {
-    if h.len() == HISTORY {
-        h.pop_front();
-    }
-    h.push_back(v);
-}
-
-/// User names by uid, from /etc/passwd; uids not there are shown as numbers.
-fn read_passwd() -> HashMap<u32, String> {
-    std::fs::read_to_string("/etc/passwd")
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|l| {
-            let mut f = l.split(':');
-            let name = f.next()?;
-            let uid = f.nth(1)?.parse().ok()?;
-            Some((uid, name.to_string()))
-        })
-        .collect()
-}
-
-fn proc_user(pid: u32, users: &HashMap<u32, String>) -> String {
-    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
-    let uid = status
-        .lines()
-        .find_map(|l| l.strip_prefix("Uid:"))
-        .and_then(|r| r.split_whitespace().next())
-        .and_then(|u| u.parse::<u32>().ok());
-    match uid {
-        Some(u) => users.get(&u).cloned().unwrap_or_else(|| u.to_string()),
-        // In a container, or another user's, the process may be out of sight.
-        None => "?".into(),
-    }
-}
-
-fn proc_command(pid: u32) -> String {
-    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
-    let cmd: Vec<String> = raw
-        .split(|&b| b == 0)
-        .filter(|a| !a.is_empty())
-        .map(|a| String::from_utf8_lossy(a).into_owned())
-        .collect();
-    if cmd.is_empty() {
-        std::fs::read_to_string(format!("/proc/{pid}/comm"))
-            .map(|s| format!("[{}]", s.trim()))
-            .unwrap_or_else(|_| "?".into())
-    } else {
-        cmd.join(" ")
     }
 }

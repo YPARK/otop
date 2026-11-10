@@ -5,18 +5,23 @@ edition = "2024"
 rust-version = "1.92"
 license = "MIT"
 authors = ["Yongjin Park <yongjin.park@ubc.ca>"]
-description = "Monitor NVIDIA GPUs and their processes in the terminal, like nvtop"
-keywords = ["gpu", "nvidia", "monitor", "tui", "nvml"]
+description = "A btop-like monitor of CPUs, memory, GPUs (NVIDIA and Apple) and processes, in the terminal"
+keywords = ["monitor", "gpu", "nvidia", "apple", "tui"]
 categories = ["command-line-utilities"]
 repository = "https://github.com/YPARK/otop"
 
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.6", features = ["derive"] }
-# NVML, loaded at run time from the driver's libnvidia-ml.so: nothing in C
-# is built, and no CUDA toolkit is needed.
-nvml-wrapper = "0.13"
 ratatui = "0.30"
+# CPUs, memory and processes, on Linux and macOS alike.
+sysinfo = { version = "0.38.4", default-features = false, features = ["system", "user"] }
+
+# NVIDIA's GPUs, through NVML, loaded at run time from the driver's
+# libnvidia-ml.so: nothing in C is built and no CUDA toolkit is needed.
+# macOS has no NVML; Apple's GPUs are read from the IORegistry instead.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+nvml-wrapper = "0.13"
 
 [profile.release]
 lto = true
