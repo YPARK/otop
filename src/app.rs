@@ -5,6 +5,7 @@ use crate::sys::{Proc, Sys};
 use crate::ui;
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use sysinfo::Signal;
 
@@ -19,6 +20,27 @@ pub enum SortBy {
 }
 
 impl SortBy {
+    pub const ALL: [SortBy; 6] = [
+        SortBy::Cpu,
+        SortBy::Mem,
+        SortBy::GpuMem,
+        SortBy::Sm,
+        SortBy::Pid,
+        SortBy::User,
+    ];
+
+    /// The name `otop mcp` takes it by; unlike the label, never changed.
+    pub fn name(self) -> &'static str {
+        match self {
+            SortBy::Cpu => "cpu",
+            SortBy::Mem => "memory",
+            SortBy::GpuMem => "gpu_memory",
+            SortBy::Sm => "sm",
+            SortBy::Pid => "pid",
+            SortBy::User => "user",
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             SortBy::Cpu => "CPU",
@@ -30,17 +52,19 @@ impl SortBy {
         }
     }
 
+    /// Whether it is known only where the GPUs say which processes use them.
+    pub fn needs_gpu(self) -> bool {
+        matches!(self, SortBy::GpuMem | SortBy::Sm)
+    }
+
     /// The next to sort by; GPU memory and SM only where they are known.
     fn next(self, gpu: bool) -> Self {
-        match self {
-            SortBy::Cpu => SortBy::Mem,
-            SortBy::Mem if gpu => SortBy::GpuMem,
-            SortBy::Mem => SortBy::Pid,
-            SortBy::GpuMem => SortBy::Sm,
-            SortBy::Sm => SortBy::Pid,
-            SortBy::Pid => SortBy::User,
-            SortBy::User => SortBy::Cpu,
-        }
+        let n = Self::ALL.len();
+        let i = Self::ALL.iter().position(|&s| s == self).unwrap_or(0);
+        (1..=n)
+            .map(|k| Self::ALL[(i + k) % n])
+            .find(|s| gpu || !s.needs_gpu())
+            .unwrap_or(self)
     }
 }
 
@@ -293,35 +317,15 @@ impl App {
 
     /// Rebuilds the rows, from the last sample, as filtered and sorted now.
     fn update_rows(&mut self) {
-        let query = self.query.to_lowercase();
-        let (procs, gpus) = (&self.sys.procs, &self.gpus.procs);
-        let gpu = |p: &Proc| gpus.get(&p.pid);
-        let mut rows: Vec<usize> = (0..procs.len())
-            .filter(|&i| {
-                let p = &procs[i];
-                let on = match (self.only, gpu(p)) {
-                    (Only::All, _) => true,
-                    (Only::AnyGpu, g) => g.is_some(),
-                    (Only::Gpu(i), g) => g.is_some_and(|g| g.gpus.contains(&i)),
-                };
-                on && p.search.contains(&query)
-            })
-            .collect();
-        let gmem = |p: &Proc| gpu(p).and_then(|g| g.mem);
-        let sm = |p: &Proc| gpu(p).and_then(|g| g.sm);
-        rows.sort_by(|&a, &b| {
-            let (a, b) = (&procs[a], &procs[b]);
-            let o = match self.sort {
-                SortBy::Cpu => a.cpu.total_cmp(&b.cpu),
-                SortBy::Mem => a.mem.cmp(&b.mem),
-                SortBy::GpuMem => gmem(a).cmp(&gmem(b)),
-                SortBy::Sm => sm(a).cmp(&sm(b)),
-                SortBy::Pid => a.pid.cmp(&b.pid),
-                SortBy::User => a.user.cmp(&b.user),
-            }
-            .then(a.pid.cmp(&b.pid));
-            if self.descending { o.reverse() } else { o }
-        });
+        let procs = &self.sys.procs;
+        let rows = select(
+            procs,
+            &self.gpus.procs,
+            self.only,
+            &self.query,
+            self.sort,
+            self.descending,
+        );
         // Keep the process picked where it still is; where it has ended,
         // the row it was in, so the selection does not jump to the top.
         let (pid, was) = self.selected.unzip();
@@ -332,6 +336,48 @@ impl App {
         self.rows = rows;
         self.select(i);
     }
+}
+
+/// The processes, as indices into `procs`, that are `only` where asked and
+/// whose PID, user, name or command contain `query`, in any case; sorted
+/// by `sort`, ties by PID, largest first if `descending`.
+pub fn select(
+    procs: &[Proc],
+    gpus: &HashMap<u32, GpuUse>,
+    only: Only,
+    query: &str,
+    sort: SortBy,
+    descending: bool,
+) -> Vec<usize> {
+    let query = query.to_lowercase();
+    let gpu = |p: &Proc| gpus.get(&p.pid);
+    let mut rows: Vec<usize> = (0..procs.len())
+        .filter(|&i| {
+            let p = &procs[i];
+            let on = match (only, gpu(p)) {
+                (Only::All, _) => true,
+                (Only::AnyGpu, g) => g.is_some(),
+                (Only::Gpu(i), g) => g.is_some_and(|g| g.gpus.contains(&i)),
+            };
+            on && p.search.contains(&query)
+        })
+        .collect();
+    let gmem = |p: &Proc| gpu(p).and_then(|g| g.mem);
+    let sm = |p: &Proc| gpu(p).and_then(|g| g.sm);
+    rows.sort_by(|&a, &b| {
+        let (a, b) = (&procs[a], &procs[b]);
+        let o = match sort {
+            SortBy::Cpu => a.cpu.total_cmp(&b.cpu),
+            SortBy::Mem => a.mem.cmp(&b.mem),
+            SortBy::GpuMem => gmem(a).cmp(&gmem(b)),
+            SortBy::Sm => sm(a).cmp(&sm(b)),
+            SortBy::Pid => a.pid.cmp(&b.pid),
+            SortBy::User => a.user.cmp(&b.user),
+        }
+        .then(a.pid.cmp(&b.pid));
+        if descending { o.reverse() } else { o }
+    });
+    rows
 }
 
 /// The refresh intervals `+` and `-` step through, in milliseconds.
@@ -353,8 +399,26 @@ fn slower(d: Duration) -> Duration {
 
 #[cfg(test)]
 mod tests {
-    use super::{faster, slower};
+    use super::{SortBy, faster, slower};
     use std::time::Duration;
+
+    /// The sorts `s` steps through from CPU, back to CPU.
+    fn cycle(gpu: bool) -> Vec<SortBy> {
+        let mut seen = vec![SortBy::Cpu];
+        while let next = seen[seen.len() - 1].next(gpu)
+            && next != SortBy::Cpu
+        {
+            seen.push(next);
+        }
+        seen
+    }
+
+    #[test]
+    fn sorts_step_through_all_and_by_gpu_only_where_known() {
+        assert_eq!(cycle(true), SortBy::ALL);
+        use SortBy::*;
+        assert_eq!(cycle(false), [Cpu, Mem, Pid, User]);
+    }
 
     fn ms(n: u64) -> Duration {
         Duration::from_millis(n)
