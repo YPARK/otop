@@ -183,12 +183,17 @@ impl Gpus {
     /// newest that has come since; if none, the last readings again, so the
     /// charts keep time.
     pub fn sample(&mut self) {
+        self.sample_within(WAIT);
+    }
+
+    /// As `sample`, waiting up to `wait` for the sample asked for.
+    pub fn sample_within(&mut self, wait: Duration) {
         let Some(r) = &self.reader else { return };
         let mut newest = r.samples.try_iter().last();
         let mut stopped = false;
         // Asked and answered in time, the sample is in step with the screen.
         if r.ask.try_send(()).is_ok() {
-            match r.samples.recv_timeout(WAIT) {
+            match r.samples.recv_timeout(wait) {
                 Ok(s) => newest = Some(s),
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => stopped = true,

@@ -9,6 +9,7 @@ mod app;
 mod apple;
 mod gpu;
 mod hist;
+mod mcp;
 #[cfg(not(target_os = "macos"))]
 mod nvidia;
 mod ps;
@@ -41,8 +42,10 @@ use std::time::Duration;
 /// Plus and minus refresh faster or slower, in steps: 100 ms, 250 ms,
 /// 500 ms, 1 s, 2 s, 5 s, 10 s, 30 s, 60 s.
 #[derive(Parser)]
-#[command(version)]
+#[command(version, args_conflicts_with_subcommands = true)]
 struct Args {
+    #[command(subcommand)]
+    command: Option<Command>,
     /// Milliseconds between samples.
     #[arg(short = 'd', long, default_value_t = 1000, value_parser = clap::value_parser!(u64).range(100..=60000))]
     interval: u64,
@@ -51,8 +54,18 @@ struct Args {
     once: bool,
 }
 
+#[derive(clap::Subcommand)]
+enum Command {
+    /// Serve the CPUs, memory, GPUs and processes to AI agents (Claude,
+    /// Cursor, ...) over MCP, on stdin and stdout.
+    Mcp,
+}
+
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    if let Some(Command::Mcp) = args.command {
+        return mcp::run();
+    }
     let every = Duration::from_millis(args.interval);
     let app = app::App::new(sys::Sys::new(), gpu::Gpus::new(), every);
     if args.once {
@@ -67,4 +80,18 @@ fn main() -> anyhow::Result<()> {
     let result = app.run(&mut terminal);
     ratatui::restore();
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Args;
+    use clap::Parser;
+
+    #[test]
+    fn mcp_takes_none_of_the_screen_s_flags() {
+        assert!(Args::try_parse_from(["otop", "mcp"]).is_ok());
+        assert!(Args::try_parse_from(["otop", "--once", "mcp"]).is_err());
+        assert!(Args::try_parse_from(["otop", "-d", "500", "mcp"]).is_err());
+        assert!(Args::try_parse_from(["otop", "-d", "500"]).is_ok());
+    }
 }

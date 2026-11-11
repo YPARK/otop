@@ -213,7 +213,7 @@ impl Sys {
                     command
                 };
                 let user = user.unwrap_or_else(|| "?".into());
-                let search = format!("{pid} {user} {name} {command}").to_lowercase();
+                let search = search_key(pid, &user, &name, &command);
                 Proc {
                     pid,
                     name,
@@ -277,6 +277,12 @@ fn user_name(uid: &Uid) -> Arc<str> {
         .filter(|n| !n.is_empty())
         .unwrap_or(uid)
         .into()
+}
+
+/// What a search of the processes matches: PID, user, name and command,
+/// in lower case.
+pub fn search_key(pid: u32, user: &str, name: &str, command: &str) -> String {
+    format!("{pid} {user} {name} {command}").to_lowercase()
 }
 
 pub fn frac(used: u64, total: u64) -> f64 {
